@@ -2,12 +2,13 @@
 
 End-to-end procedure for the Samsung Galaxy S9 with the Qualcomm SDM845 — the
 `starqltechn` board in `tools/mkadt.py`. Nothing here has run on hardware as of
-2026-10-21: the kernel builds in CI (run 39590143218, `xnu-kernel` artifact,
-17,172,536-byte `kernel.development.starqltechn`) and the whole chain from Mach-O
-to a Samsung `boot.img` runs on a Linux host against a synthetic stock image
-(46,816-byte loader Image, 16,658,432-byte `starq-ios-boot.img` with the stock
-header and a recomputed kernel SHA-1), but the phone side is written and unrun.
-Everything that needs the phone is in "What is still open".
+2026-10-22: the kernel builds in CI (`xnu-kernel` artifact, 17,172,688-byte
+`kernel.development.starqltechn`) and the whole chain from Mach-O to a Samsung
+`boot.img` runs on a Linux host against the phone's **own** pulled boot partition
+(`data/boot.emmc.win.img`, gitignored; see step 2): 56,384-byte loader
+Image, 27,828,224-byte `starq-ios-boot.img` with the stock header, the stock
+`Image.gz-dtb` DTB set and a recomputed kernel SHA-1. The phone side is written
+and unrun. Everything that needs the phone is in "What is still open".
 
 ## Reference ports
 
@@ -19,8 +20,11 @@ Everything that needs the phone is in "What is still open".
 
 The S8 is the closest Samsung reference, but it is Exynos: it says nothing about
 the SDM845 side (memory map, RPMh, UFS, GENI, PMIC). Those addresses come from
-mainline's `sdm845-samsung-starqltechn.dts` and have to be confirmed against the
-live FDT (see "What is still open").
+mainline's `sdm845-samsung-starqltechn.dts`, and its `boot.img` shape was an
+Exynos assumption that the real phone disproved (see "The two stock boot.img
+shapes"). The RAM window, framebuffer and ramoops addresses are now confirmed
+against the phone's own DTB; the remaining unconfirmed ones are listed in "What
+is still open".
 
 ## Read this first: there is no fastboot
 
@@ -29,9 +33,11 @@ Unlike the Redmi Note 10 Pro in the main README, **this phone has no
 refuses to boot an arbitrary kernel from a host: nothing like `fastboot boot`
 exists here.
 
-So **every kernel iteration is a write to the boot partition**:
+So **every kernel iteration is a write to the boot partition**, either from
+Download Mode (`tools/starq-odin.sh` + `odin4`, Linux-native) or from TWRP
+(`adb push` + `dd`); step 3 compares them:
 
-1. boot TWRP, `adb push` the image, `dd` it onto `/dev/block/by-name/boot`;
+1. write the image to `/dev/block/by-name/boot`;
 2. reboot and watch the screen — the shim draws its text on the panel,
    because the debug UART is not wired out on this board;
 3. TWRP again (`Vol Up + Bixby + Power`) to read pstore and repeat.
@@ -64,8 +70,10 @@ tools/starq-flash.sh backup        # boot, recovery, efs, persist, modem -> back
 
 `backup/starq/boot.img` is not optional: it is the template every later image
 is packed from (header addresses, page size, `os_version`, board name and the
-Qualcomm DTBH `dt` section). `efs` and `persist` hold this phone's own
-calibration data.
+kernel's appended DTB set — there is no DTBH `dt` section, see "The two stock
+boot.img shapes"). `efs` and `persist` hold this phone's own calibration data.
+A copy of this phone's partition already exists in `data/`
+(`data/boot.emmc.win.img`, gitignored), which is what the packing runs below use.
 
 Keep the matching stock AP (Odin package) too — it is the only way back from a
 broken boot partition.
@@ -88,7 +96,8 @@ config at a time**: a second dispatch within seconds silently cancels the first.
 
 | Run | `machine_config` | Result |
 | --- | --- | --- |
-| 39590143218 | STARQLTECHN | success, 17,172,536-byte `kernel.development.starqltechn` |
+| 39590143218 | STARQLTECHN | success, first `kernel.development.starqltechn` (17,172,536 bytes) |
+| 39611433630 | STARQLTECHN | success, 17,172,688-byte `kernel.development.starqltechn` (current) |
 | 39591208114 | SWEET | success (the sweet port still builds) |
 
 ## 2. Build the boot image
@@ -109,6 +118,14 @@ through the shim build).
 ```sh
 tools/starq-boot.sh xnu/out/kernel.development.starqltechn \
     backup/starq/boot.img starq-boot.img
+```
+
+On a host that has pulled this phone's partition, use it as the template instead —
+that is the invocation the measured sizes below come from:
+
+```sh
+tools/starq-boot.sh xnu/out-starqltechn/kernel.development.starqltechn \
+    data/boot.emmc.win.img shim/out/starq-ios-boot.img
 ```
 
 That runs, in order:
@@ -160,6 +177,13 @@ python3 tools/starq_mkboot.py --info data/boot.emmc.win.img   # a real stock ima
 python3 tools/starq_mkboot.py --shape data/boot.emmc.win.img  # dtbh | appended | none
 ```
 
+`data/` is **gitignored** and holds device-specific pulls, not repo content:
+`boot.emmc.win.img` (TWRP dump of this phone's boot partition) and
+`kernelsu_next_patched_20260222_092506.img` (the same partition from a custom
+Android 13 ROM). They carry this handset's cmdline, serial and device tree, so
+they never get committed. Everything below that reads `data/...` works only on a
+host that has pulled them; `backup/starq/boot.img` is the equivalent template.
+
 ### The two stock boot.img shapes
 
 `tools/starq_mkboot.py` probes the template and packs the matching shape; no
@@ -182,19 +206,37 @@ so S-Boot's board-id selection is unchanged. The `Image` is our own loader and
 is **not** gzipped: S-Boot has no decompression to do, so raw `Image` + DTBs is
 the exact analogue of `Image.gz-dtb`.
 
+**S-Boot picks one of the 15 FDTs by `qcom,board-id`/`qcom,msm-id` and passes it
+to the kernel in `x0`** — the same contract the sweet shim has, which is why
+`shim/starqltechn/start.S` and `loader.c` need no change for this shape: they read
+`/chosen/linux,initrd-start`, `/chosen/bootargs` etc. out of whatever tree arrived
+in `x0`. Which of the 15 it picks is **not recorded in the boot image**; the live
+DTB's first entry has `qcom,board-id = <0x08 0x08>`, but the selection itself has
+to come from the bootloader log or from the `model` string the loader can print.
+
+The DTB set is an **unpadded** concatenation, so member #2 starts at an odd offset
+(`0xb5c9d`) and its own header is not 4-byte aligned. `shim/fdt.c` therefore reads
+big-endian byte-wise and aligns offsets relative to the FDT base, not absolutely —
+an aligned `u32` load is a fault with the MMU off.
+
 The trailer `id` is the AOSP v0 signature, SHA-1 over `kernel|ramdisk|second`,
 each followed by its u32 length; the dt section is not part of it. (The old
 README of this tool said dt was included — the real images disprove that; the
 dt form is only used when a dt section exists, as the legacy Samsung extension.)
 
-Measured artifacts on a Linux host (real kernel from CI, synthetic stock image):
+Measured artifacts on a Linux host (real kernel from CI, real stock image
+`data/boot.emmc.win.img`):
 
 | Artifact | Size |
 | --- | --- |
-| `kernel.development.starqltechn` (CI run 39590143218) | 17,172,536 bytes |
+| `kernel.development.starqltechn` (CI run 39611433630) | 17,172,688 bytes |
 | payload (`mkpayload.py`) | 16,596,320 bytes |
-| `shim/out/Image` (loader, arm64 Linux header, magic `ARMd` at `0x38`) | 46,816 bytes |
-| `starq-ios-boot.img` | 16,658,432 bytes |
+| `shim/out/Image` (loader, arm64 Linux header, magic `ARMd` at `0x38`) | 56,384 bytes |
+| `starq-ios-boot.img` (loader `Image` + 15 stock DTBs, 64 MiB partition) | 27,828,224 bytes |
+
+The boot image leaves 39,280,640 bytes of the partition unused; its header differs
+from the template only in `kernel_size` and `ramdisk_size` (`dt_size` stays 0,
+`os_version`/`kernel_addr`/`ramdisk_addr`/`tags_addr` unchanged).
 
 The loader can be built and packed on its own, without the kernel pipeline:
 
@@ -242,6 +284,9 @@ git clone https://github.com/Llucs/odin4 && cd odin4
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DODIN4_BUILD_GUI=OFF
 cmake --build build --parallel $(nproc)
 ```
+
+Built that way on the dev host with odin4 **7.3.0**; the GUI is the only part that
+wants Qt6.
 
 ```sh
 tools/starq-odin.sh install-udev                            # sudo: 04e8 download-mode USB access
@@ -294,9 +339,10 @@ The loader paints the pattern before it validates the payload, so what the panel
 shows in the first second is the answer to the one question that decides the rest
 of the display work. Stand at the phone, do not film — the pattern is static:
 
-1. Flash, `adb reboot`, watch the panel. Four 64-line bands (white, red, green,
-   blue) at the top, then the loader's console text, then a magenta block with a
-   cyan square.
+1. Flash (`tools/starq-odin.sh flash ... --yes` reboots into the new image itself;
+   the TWRP path needs `adb reboot`), watch the panel. Four 64-line bands (white,
+   red, green, blue) at the top, then the loader's console text, then a magenta
+   block with a cyan square.
 2. **Bands and block visible** -> S-Boot left MDSS scanning out of `0x9d400000`.
    Record it and stop worrying about display: the sweet CPU-copy path transfers.
 3. **Samsung logo, black or garbage** -> command-mode panel with its own GRAM.
@@ -324,26 +370,32 @@ Odin. If `userdata` was overwritten with the iOS root, format it in TWRP.
 
 ## What is still open
 
-- The RAM window `0xa2000000 + 0x18000000` is the largest free gap in the low
-  4 GB bank per Samsung's `reserved-memory` map, and `0xa2000000` is where
-  postmarketOS loads its initramfs on this device. It is a best guess for XNU:
-  confirm against the live FDT before trusting a crash log. The loader and
-  `tools/starq-boot.sh` both hardcode it; `starqwin=BASE:SIZE` on the boot-args
-  overrides it for the loader's check without a rebuild.
+- The RAM window `0xa2000000 + 0x18000000` is the **largest free gap in the low
+  4 GB bank** of the live DTB's `reserved-memory` (`0xa1c01000 + 0x183ff000`,
+  388 MiB), bounded below by `sec_debug_autocomment` (ends `0xa1c01000`) and
+  ending exactly at `0xba000000`, the start of `modem_shared_mem_region`. It was
+  a guess (postmarketOS loads its initramfs at `0xa2000000`) that the pulled DT
+  confirmed. The loader and `tools/starq-boot.sh` both hardcode it; `starqwin=BASE:SIZE`
+  on the boot-args overrides it for the loader's check without a rebuild.
 - `tools/mkadt.py` still marks `starqltechn` provisional; passing
   `--ram-base/--ram-size` (which `starq-boot.sh` does) silences its warning.
-- Framebuffer address and panel geometry (`0x9d400000`, 1440×2960) come from
-  mainline's `framebuffer_mem` node, not from a live dump.
+- Framebuffer address and panel geometry (`0x9d400000`, 1440×2960) match the live
+  DTB's `cont_splash_region` (`0x9d400000`, size `0x2400000`); the geometry itself
+  is still mainline's.
 - **Does the panel scan out of `0x9d400000` at all?** Likely **no**: both S9
   panels are declared `dsi_cmd_mode` in the vendor DTS
   (`dtsi_px01.dtsi:70`, `dtsi_mq01.dtsi:66`), i.e. command mode with their own
   GRAM, in which case nothing written to that buffer reaches the panel and MDSS
-  `write_memory_start` plus a DSI bring-up has to be programmed. This is the
-  single most important open question for the display. The loader answers it
-  two ways: it paints a test pattern (`starqfb=1`, described in "The
-  framebuffer test pattern" below) *and* it prints DSI_CTRL's enable/video/cmd
-  bits, which is the deciding evidence regardless of what is on the panel — see
-  "Read this before trusting the framebuffer path".
+  `write_memory_start` plus a DSI bring-up has to be programmed. The phone's own
+  pulled DTB does **not** settle it: it declares both panel models
+  (`samsung,disp-model` = `"AMB577MQ01"` *and* `"AMB577PX01"`) and only restates
+  `dsi_cmd_mode`. This is the single most important open question for the display.
+  The loader answers it two ways: it paints a test pattern (`starqfb=1`, described
+  in "The framebuffer test pattern" below) *and* it prints DSI_CTRL's
+  enable/video/cmd bits, which is the deciding evidence regardless of what is on
+  the panel — see "Read this before trusting the framebuffer path".
+  It is also why a ready image is not a ready display: `starq-odin.sh flash`
+  answers the boot question, not this one.
 - The `by-name` node names are unconfirmed. `tools/starq-flash.sh` resolves
   `/dev/block/by-name/<part>`, then `bootdevice/by-name`, then
   `platform/soc/*/by-name`, and never hardcodes `sdaN`, but the names
@@ -353,12 +405,22 @@ Odin. If `userdata` was overwritten with the iOS root, format it in TWRP.
   `make -C shim/starqltechn` (step 2 above): the same loader.c compiled as host
   C with the board addresses `mmap`ed, driving its validation, copy and logging
   paths. The cross build does now succeed on the dev host (`gcc-aarch64-linux-gnu`
-  from apt, 46,816-byte Image), but a successful link only proves the code
+  from apt, 56,384-byte Image), but a successful link only proves the code
   compiles and fits; every MMIO address in it is still unproven.
-- The stock `boot.img` used for packing so far is a **synthetic but realistic**
-  stub (20 MiB kernel slot, page 4096). The real one may reserve a different
-  kernel size, `os_version`, board name or DTBH table — pull it
-  (`tools/starq-flash.sh backup`) and repack before the first flash.
+- **Which of the 15 appended DTBs does S-Boot pick?** The stock `Image.gz-dtb`
+  carries one FDT per `qcom,board-id` (`(0x8, 0x2)` … `(0x8, 0xe)`) and S-Boot
+  passes the matching one to the kernel in `x0`, but the boot image does not
+  record which one it selected. This phone's board-id is in the live DTB
+  (`qcom,board-id = <0x08 0x08>` in the first entry), yet the actual selection
+  has to be confirmed from the bootloader's own log, or from the `model` string
+  the loader can print out of the DTB it receives in `x0`. It matters because
+  everything the loader reads from `/chosen` comes from that one tree.
+- The stock `boot.img` template is now the phone's own partition, pulled to
+  `data/boot.emmc.win.img` (gitignored). Header, `os_version` and DTB set are
+  therefore real, and the image is packed from them. What is still unverified is
+  the **member name**: `boot.img` is the convention Samsung's AP archives use, not
+  something read off this phone's PIT — `tools/starq-odin.sh check` settles it
+  before anything is written.
 
 ## The loader: `shim/starqltechn/`
 
@@ -373,7 +435,7 @@ is untouched and still produces the same `mkbootimg` command line.
 | `loader.ld` | Linked at 0, 32 KiB stack after `.bss`, no secondary stacks. |
 | `loader.c` | The S-Boot-specific loader (see below). |
 | `dsi.c` | DSI0 command-DMA transmit (`starq_dsi_dcs_write`), the panel probe from `/chosen/bootargs`, the `starqelvss=`/`starqmps=` parsers, the panel-aware default sequence and the read-only `DSI_CTRL` mode probe. See "Panel ELVSS override over DSI" above. |
-| `build.sh` | Compile + optional pack. `build.sh STOCK_BOOT.img PAYLOAD.bin OUT.img [DTBH.bin|FDT_DIR]`, packed by `tools/starq_mkboot.py`, so `mkbootimg` is not needed. |
+| `build.sh` | Compile + optional pack. `build.sh STOCK_BOOT.img PAYLOAD.bin OUT.img [DTB.bin|FDT_DIR]`, packed by `tools/starq_mkboot.py`, so `mkbootimg` is not needed. It probes the stock shape itself and substitutes the right section (`--dtb` for a DTBH template, `--dtb-set` for `Image.gz-dtb`); the argument is optional. |
 | `Makefile` | `make -C shim/starqltechn` builds and runs the host test. |
 
 ### What it does, in order
@@ -674,9 +736,10 @@ text at +12):
 | `0xa1380000` | `0x40000` | `pmsg-ramoops-0` | the same log, second copy |
 | `0xa13c0000` | `0x40000` | `ftrace-ramoops-0` | untouched |
 
-(from `ramoops@0xa1300000`, size `0x100000`, in both the mainline and the
-vendor DT; `fs/pstore/ram.c` lays the zones out in that order regardless of the
-property order.) Two copies because a forced reboot (`Power + Vol Down`) can
-tear one zone header, and pstore then drops that zone - with two, one usually
-survives. `tools/starq-flash.sh pull-log` already reads both files.
+(from `ramoops@0xa1300000`, size `0x100000` — confirmed in the phone's own pulled
+DTB, and the same in the mainline and vendor DT; `fs/pstore/ram.c` lays the zones
+out in that order regardless of the property order.) Two copies because a forced
+reboot (`Power + Vol Down`) can tear one zone header, and pstore then drops that
+zone - with two, one usually survives. `tools/starq-flash.sh pull-log` already
+reads both files.
 
