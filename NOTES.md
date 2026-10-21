@@ -2,6 +2,122 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-21: starqltechn (Galaxy S9 SDM845) port started | kernel + boot chain GREEN, nothing on hardware yet <<<
+
+**Decision.** Port to `starqltechn` (Galaxy S9 SM-G9600 / SC-02K, SDM845) with the
+`sweet` port as the reference implementation. There is no existing starqltechn iOS
+port to copy: the only Samsung bring-up that reaches userspace is the Exynos 8895 S8
+(`Floppikrob/ios-galaxy-s8`), which supplies the Samsung `boot.img` packing scheme,
+the BOOT-partition/TWRP workflow, the S6SY761 protocol (same touch IC as the S9),
+the ramoops logging scheme and the XNU-RAM-zeroing lesson - but nothing for the SoC.
+`sweet` stays the default everywhere (`BOARD`, `mkadt.py --board`), so the working
+port is unaffected.
+
+**Built (on `main`, pushed):**
+- `b4d36f0` board table: `tools/mkadt.py` `BOARDS` (`sweet` default | `starqltechn`)
+  plus `--board`, `--ram-base/--ram-size`; `FB_*` in `shim/console.h` and `shim/mmu.h`
+  behind `#ifndef`; `BOARD=` dispatch in `shim/build.sh` (sends `starqltechn` to
+  `shim/starqltechn/build.sh`, leaves the sweet path as it was). sweet output is
+  byte-identical to before: 9904-byte ADT plain and `--highmem`, 4164 for `--qemu`.
+- `5cbb363` Samsung boot image pipeline: `tools/starq_mkboot.py` (boot.img v0 packer
+  reusing the stock header and its DTBH `dt` section, kernel SHA-1 rewritten at
+  `0x240`, `SEANDROIDENFORCE` appended), `tools/starq-boot.sh` (kernel -> ADT ->
+  payload -> loader -> packed image), `tools/starq-flash.sh` (`boot-name`, `backup`,
+  `boot`, `pull-log` over adb in TWRP), `tools/README-starqltechn.md`.
+- `5c3a3ef` `xnu/patches/0082-starqltechn-board.patch`: STARQLTECHN machine config,
+  early framebuffer, RPMh addresses, S6SY761 touch with S2DOS05 bit-banged rails,
+  MAX77705 battery, PM8998 PON/GPIO keys.
+- `d191a0b` `shim/starqltechn/`: the S-Boot loader (`start.S`, `loader.ld`,
+  `loader.c`, `build.sh`, `host_test.c`, `Makefile`) - the S8-proven validation
+  chain, XNU-RAM zeroing, dual-zone ramoops logging, and the framebuffer test
+  pattern that decides the display work.
+
+**The two regressions, and why they generalise to any new board.** Both came from
+adding a second machine config to a tree that had only ever had one; neither was
+visible in a sweet-only build. Details in the two blocks below — note that both
+those blocks still end with "CI not run" / "Next: push -> rerun CI": both runs are
+now green, see the table below.
+
+1. **Link failure, not compile failure (`bab67f6`, CI 39577311640).** 0082 rewrote
+   ~41 files from `#if defined(ARM64_BOARD_CONFIG_SWEET)` to `#if defined(SWEET)`
+   (`SWEET` is `#define`d in `pexpert/pexpert/arm64/SWEET.h`, which 28 of them never
+   include) and added `-DSWEET` to `MACHINE_FLAGS_ARM64_STARQLTECHN` but not to
+   `MACHINE_FLAGS_ARM64_SWEET`. In a SWEET build every gated file then compiled to
+   nothing -> link error for `_sweet_amfi_policy_register`, `_sweet_log_*`,
+   `_sweet_ufs_rootdev`, `_sweet_rpmh_vreg_enable`, `_br_sha384_*`.
+   => a board patch that shortens the config macro must define it for the new config
+   *and* keep it defined for the old one. A gate that is false everywhere has no
+   diagnostic until the linker.
+2. **Exact-string machine gates outside the kernel tree (`6c1f4e6`, CI 39581943003).**
+   `0019-stage-libpthread.sh`, `0020-stage-bearssl.sh`, `0026-stage-hfs.sh` each began
+   `[[ "$MACHINE_CONFIG" == SWEET ]] || exit 0`, so a STARQLTECHN build never staged
+   the third-party sources 0082 compiles: `sweet_bearssl/src/hash/sha2big.c`,
+   `sweet_libpthread/kern/kern_init.c`, and all of `bsd/sweet_hfs/core/` (which
+   includes `core/kext-config.h`) - 22 errors, none of them an include-path problem.
+   Widened to `case ... in SWEET|STARQLTECHN)`. The third failure hid: 0070's
+   `#if CONFIG_EMBEDDED || defined(ARM64_BOARD_CONFIG_SWEET)` on syscall 435
+   (`pid_hibernate`) in `bsd/kern/syscalls.master` was not widened, and that file
+   *generates* `sysproto.h`, so STARQLTECHN lost `struct pid_hibernate_args` and
+   failed in the unrelated `bsd/vm/vm_unix.c:1774` ("incomplete definition").
+   => adding a config means grepping the shared macro/string name across the whole
+   tree, shell scripts and `files`/`syscalls.master` inputs included; the error
+   usually surfaces in a file unrelated to the gate.
+
+**CI (GitHub Actions `xnu`, macos-14, Xcode 15):**
+
+| run | `MACHINE_CONFIG` | result |
+| --- | --- | --- |
+| 39590143218 | STARQLTECHN | success - `xnu-kernel` artifact = 17,172,536-byte `kernel.development.starqltechn` (verified Mach-O arm64, cputype 0x0100000c, 26 load commands) |
+| 39591208114 | SWEET | success (regression cleared) |
+
+The workflow has `concurrency: group: xnu-${{ github.ref }}` with `cancel-in-progress:
+true`, so two dispatches within seconds cancel each other: **run one config at a
+time**. Run 39585689828 died on a GitHub infrastructure network error and then sat
+`queued` with zero jobs for ~35 min; a fresh dispatch started immediately.
+
+**Local verification (measured on the dev host, no phone involved):**
+- `gcc-aarch64-linux-gnu` and `mkbootimg` installed via apt. `tools/starq-boot.sh`
+  now checks the cross tools up front and prints the apt line instead of failing
+  halfway through the shim build.
+- iPhone X device tree extracted and decoded: `tools/remotezip.py` pulled
+  `Firmware/all_flash/DeviceTree.d22ap.im4p` from the 16.7.16/20H392 IPSW, the DER
+  IM4P `bvx2` payload decoded with a locally built `lzfse` ->
+  `research/ipsw-x/d22ap.adt` (186,084 bytes, not in git). With it,
+  `mkadt.py --board starqltechn` emits a **12,588-byte** ADT including `/product`;
+  without it 9,904 bytes and a warning (no `/product` -> MobileGestalt identity
+  degrades, the same wall sweet hit in 0059).
+- Full chain: `mkpayload.py` -> 16,596,320-byte payload;
+  `BOARD=starqltechn PACK=0 shim/build.sh` and `shim/starqltechn/build.sh` both
+  produce a **46,816-byte** arm64 Linux Image (`ARMd` magic at `0x38`, text_offset
+  `0x80000`, flags `0xa`).
+- `tools/starq-boot.sh` end to end against a synthetic but realistic stock `boot.img`
+  (20 MiB kernel slot) -> `starq-ios-boot.img`, **16,658,432 bytes**: stock header
+  preserved (page 4096, kernel@0x8000, ramdisk@0x2000000, second@0xf00000,
+  tags@0x1e00000), kernel SHA-1 recomputed and verified, `SEANDROIDENFORCE`
+  appended. The packer's "kernel larger than the stock image reserves" guard was
+  confirmed to fire on an undersized stub.
+- Nothing has run on the S9. The only executed loader code is
+  `make -C shim/starqltechn`: `loader.c` as host C with the board addresses
+  `mmap`ed (validation failures, RAM zeroing, segment copies, `boot_args`/
+  `deviceTreeP`, pattern, both ramoops zones). That proves the logic, not the
+  hardware facts.
+
+**Open, needs the phone (in order):**
+1. Live FDT for the RAM window: TWRP, `adb shell cat /sys/firmware/fdt > live.dtb`.
+   `0xa2000000 + 0x18000000` is Samsung's largest free gap in the vendor
+   `reserved-memory` map plus the postmarketOS initramfs load address - not measured
+   on this handset.
+2. Real `by-name` node names: `tools/starq-flash.sh boot-name`.
+3. The real stock `boot.img` as the packer's header/DTB donor instead of the
+   synthetic stub (`tools/starq-flash.sh backup`).
+4. **The framebuffer question, which decides the display work:** run the loader's
+   test pattern. Bands + magenta block visible -> S-Boot leaves the panel scanning
+   out of `0x9d400000` and sweet's CPU-copy display path transfers unchanged.
+   Samsung logo, black or garbage instead -> command-mode panel with its own GRAM;
+   MDSS/DSI has to be programmed, a much bigger job.
+5. `tools/starq-flash.sh backup` before the first flash: a bad `boot.img` is only
+   recoverable by flashing a stock AP with Odin.
+
 ### >>> UPDATE 2026-10-21: starqltechn staging + pid_hibernate FIXED (commit 6c1f4e6, CI not run) <<<
 
 CI run **39581943003** (`MACHINE_CONFIG=STARQLTECHN`) failed with 22 "file not found"
