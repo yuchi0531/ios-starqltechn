@@ -2,7 +2,128 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-22: real boot partition pulled — Image.gz-dtb, RAM window confirmed, Odin4 flash path <<<
+
+**Read this first.** The phone's own boot partition is now on disk, so the two facts this
+port had been assuming can be checked instead of guessed - one was **wrong**, the other was
+**right**. A ready-to-flash image exists and fits, with 37.5 MiB of the 64 MiB partition free.
+
+**The material.** `data/boot.emmc.win.img` (TWRP dump) and
+`data/kernelsu_next_patched_20260222_092506.img` (same partition, custom Android 13 ROM +
+KernelSU), both 64 MiB, both `data/` and therefore **gitignored** (device-specific: the
+boot images carry the phone's own cmdline and DT). Both are boot.img **v0**, page 4096,
+`kernel_addr=0x8000`, `ramdisk_addr=0x1000000`, `tags_addr=0x100`, second size 0,
+`os_version=0x1a0001a2` (Android 13, 2026-02), 16 zero `name` bytes, a real Android cmdline,
+trailer `SEANDROIDENFORCE`.
+
+**Correction 1 of 2 - the port assumed a DTBH table. There is none.**
+"Qualcomm `DTBH` in the boot image's `dt` section" was inherited from the
+Floppikrob/ios-galaxy-s8 Exynos reference and from mainline's DTS comments. The real images
+have **`dt_size == 0`** and no dt section at all. The kernel slot is an **`Image.gz-dtb`**:
+a gzip stream that ends at `0xe5352e`, followed by **15 concatenated bare FDTs** in the
+remaining `0xaa5e86` bytes. All 15 are `"Samsung STARQLTE CHN PROJECT RevNN"`, over 13
+distinct `qcom,board-id` values `(0x8, 0x2)` … `(0x8, 0xe)` and
+`qcom,msm-id (0x141, 0x10000 | 0x20000 | 0x20001)`; the per-FDT table is in the section
+below. **S-Boot selects one FDT by board-id/msm-id and hands it to the kernel in `x0`** -
+exactly the contract `shim/starqltechn/start.S` + `loader.c` already implement (they read
+`/chosen/...` out of that tree), which is why the loader needed no change for this. The
+packer now probes the template and handles both shapes; the DTBH path is unchanged for
+templates that have one.
+
+**Correction 2 of 2 - the RAM window was a guess and is now measured.**
+From the live DTB's `reserved-memory`, the free gaps in the low 4 GB bank are:
+
+| Free gap (start + size) | Free | Note |
+| --- | --- | --- |
+| `0x80000000 + 0x5700000` | 87 MiB | |
+| `0x85f00000 + 0x8100000` | 129 MiB | |
+| `0x96700000 + 0x6d00000` | 109 MiB | |
+| `0xa1c01000 + 0x183ff000` | 388 MiB | **largest real gap; this is ours** |
+| `0xc0000000 + 0x40000000` | 1024 MiB | runs to the 4 GiB bank end |
+
+The window we already use, **`0xa2000000 + 0x18000000`**, sits inside the 388 MiB gap and
+ends **exactly at `0xba000000`** - the start of `modem_shared_mem_region`. Below it is
+`sec_debug_autocomment`, which ends at `0xa1c01000`; the `0x3ff000` (4 MiB) between that and
+our base is the entire margin. **The guess was correct, and is now confirmed against the
+device's own device tree** - the loader and `starq-boot.sh` values do not change.
+
+Three other numbers stopped being assumptions in the same dump:
+
+| Fact | Was | Now (live DTB) |
+| --- | --- | --- |
+| framebuffer | mainline `framebuffer_mem` guess | `cont_splash_region` @ **`0x9d400000`**, size **`0x2400000`** - the address we write is right |
+| pstore zones | mainline DT | `ramoops` @ **`0xa1300000`**, size **`0x100000`** - the four 0x40000 zones we write are right |
+| panel identity | vendor DTS inference | live DTB declares **both** `samsung,disp-model = "AMB577MQ01"` and `"AMB577PX01"`, so one image serves either phone; the fitted one must still be read from `msm_drm.dsi_display0` at boot (`starqelvss=` default already does this) |
+
+**Odin flash path (commits `085543f`, `33aaeb6`).** Flashing no longer needs Windows, Wine or
+TWRP: `tools/starq_odin_tar.py` + `tools/starq-odin.sh` speak the Thor USB protocol over
+libusb through `odin4`.
+
+```sh
+tools/starq-odin.sh build  shim/out/starq-ios-boot.img   # -> starq-ios-boot.tar
+tools/starq-odin.sh check  starq-ios-boot.tar            # GATE: odin4 --check-only, PIT match
+tools/starq-odin.sh flash  starq-ios-boot.tar --yes      # re-runs check, then writes + reboots
+tools/starq-odin.sh restore AP_TAR --yes                 # stock AP; replaces the Windows-only route
+```
+
+- The `check` gate is mandatory and not skippable: it downloads the phone's own PIT and
+  matches every archive member against it, writing nothing. `flash` calls it again.
+- **odin4 is write-only.** It cannot back up or read logs, so `starq-flash.sh backup` and
+  `pull-log` still need TWRP. `backup/starq/boot.img` stays the donor template.
+- `--efs-clear` is never passed. `--allow-unknown` is reachable only from `check`, and warns.
+- odin4 was built on the dev host with `cmake -DODIN4_BUILD_GUI=OFF` (the GUI wants Qt6 and
+  is not needed); version **7.3.0**. The member name is still a convention (`boot.img`), not
+  a verified PIT fact - `check` is how that gets settled.
+
+**Packer + fdt fixes (same commits).**
+- `tools/starq_mkboot.py`: `--info` now describes an `Image.gz-dtb` (locates the gzip end
+  with `zlib.decompressobj(16+MAX_WBITS)` and `unused_data`, then walks the concatenated
+  FDTs reporting offset/size/model/board-id/msm-id); `pack()` appends the stock DTB set
+  after our raw `Image` when the template has no DTBH; `--dtb-set DIR_OR_FILE` substitutes a
+  set; `--shape dtbh|appended|none` prints the verdict.
+- **Real bug fixed:** the trailer SHA-1 at `0x240` must cover `kernel|ramdisk|second` (and
+  `dt` only when a dt section exists). The old code always hashed an empty `dt`, so every
+  real image reported a STALE id.
+- **Latent loader bug fixed:** `shim/fdt.c` used aligned absolute `u32` loads, but the
+  appended DTB set is an **unpadded cat**, so member #2 begins at an odd offset
+  (`0xb5c9d`); with the MMU off that is Device memory and the load faults. It is now
+  byte-wise `be32` with offsets aligned relative to the FDT base, plus host tests.
+
+**The image is built and fits (not yet flashed).**
+
+```
+tools/starq-boot.sh xnu/out-starqltechn/kernel.development.starqltechn \
+    data/boot.emmc.win.img shim/out/starq-ios-boot.img
+-> 27,828,224 bytes (26.5 MiB) into a 64 MiB partition, 39,280,640 bytes slack
+```
+
+Header diffed against the stock template: **only** `kernel_size` and `ramdisk_size` changed.
+`kernel_addr`, `ramdisk_addr`, `second_*`, `tags_addr`, `page_size`, `dt_size` (stays 0) and
+`os_version` are byte-identical; the appended DTB set is byte-identical to stock (15 FDTs);
+trailer `SEANDROIDENFORCE`; SHA-1 valid. The loader `Image` is now **56,384 bytes** - every
+earlier size quoted for it (56,096, 46,816) is stale.
+
+**Still unresolved, and it is now the only thing blocking the display work: command mode or
+video mode?** The live DTB does not answer it (it declares both panels, and declares them
+`dsi_cmd_mode`), so the runtime register does: the loader's `STARQ DSI: DSI_CTRL=...` line on
+the first boot decides. `video=1` -> the framebuffer at `0x9d400000` is being scanned out and
+sweet's CPU-copy path applies. `cmd=1` + `video=0` -> the panel holds the frame in its own
+GRAM, nothing written to RAM appears, and MDSS `write_memory_start` + a real DSI bring-up
+become mandatory. `en=0` -> link down, nothing sent, XNU still starts.
+
+**Also still open: which of the 15 appended DTBs S-Boot selects.** It picks by
+`qcom,board-id`/`msm-id`, and the boot image does **not** record which one was chosen. The
+phone's own board-id is readable from the live DTB (`qcom,board-id = <0x08 0x08>` appears in
+the first entry), but the *actual selection* has to be confirmed from the bootloader's own log
+or from the `model` string our loader can log out of the DTB it receives in `x0`.
+
+**Next, in order:** `starq-odin.sh check` with the phone in Download Mode; `flash`; read the
+`DSI_CTRL` line and the `STARQ panel:` token; then decide the display plan.
+
 ### >>> UPDATE 2026-10-22: real stock boot.img is Image.gz-dtb; packer + loader fixed <<<
+
+*(Superseded/expanded by the section above for everything except the per-FDT table and the
+packer/fdt fix detail, which live here.)*
 
 The user pulled two **real** boot partitions off the S9 into `data/` (gitignored):
 `data/boot.emmc.win.img` and `data/kernelsu_next_patched_20260222_092506.img`, both
