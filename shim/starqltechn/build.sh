@@ -67,10 +67,18 @@ if [ $# -eq 3 ]; then
 	python3 "$here/../../tools/starq_mkboot.py" "$1" "$OUT/Image" "$2" "$3"
 	sha256sum "$3"
 elif [ $# -eq 4 ]; then
-	# A different DTBH table to carry instead of the stock one's dt section.
-	python3 "$here/../../tools/starq_mkboot.py" "$1" "$OUT/Image" "$2" "$3" --dtb "$4"
+	# Substitute the stock DTBs: a DTBH table when the stock image has a dt
+	# section, an FDT set when it is Image.gz-dtb. The packer probes the shape
+	# and rejects the wrong flag with an explanation.
+	if [ "$(python3 "$here/../../tools/starq_mkboot.py" --shape "$1")" = appended ]; then
+		flag=--dtb-set
+	else
+		flag=--dtb
+	fi
+	python3 "$here/../../tools/starq_mkboot.py" "$1" "$OUT/Image" "$2" "$3" \
+		"$flag" "$4"
 	sha256sum "$3"
 elif [ $# -ne 0 ]; then
-	echo "usage: $0 [STOCK_BOOT.img PAYLOAD.bin OUT.img [DTBH.bin]]" >&2
+	echo "usage: $0 [STOCK_BOOT.img PAYLOAD.bin OUT.img [DTBH.bin|FDT_DIR]]" >&2
 	exit 2
 fi

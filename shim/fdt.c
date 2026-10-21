@@ -21,9 +21,18 @@
  * loop inside totalsize forever, so give up after this many. */
 #define FDT_MAX_TOKENS	100000u
 
+/*
+ * Byte-wise big-endian load. It must not be a plain u32 load: with the MMU off
+ * everything is Device memory and an unaligned u32 access faults. The FDT S-Boot
+ * hands us need not be 4-byte aligned -- in an Image.gz-dtb the DTBs are an
+ * unpadded cat, so member #2 of the stock starqltechn set starts at 0xb5c9d.
+ */
 static uint32_t be32(uintptr_t a)
 {
-	return __builtin_bswap32(*(volatile uint32_t *)a);
+	const volatile uint8_t *p = (const volatile uint8_t *)a;
+
+	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 |
+	       (uint32_t)p[2] << 8 | (uint32_t)p[3];
 }
 
 /* Length of the NUL-terminated string at p, or -1 if it runs past end. */
@@ -48,9 +57,13 @@ static int str_eq(uintptr_t p, uintptr_t end, const char *want)
 	return *want == 0;
 }
 
-static uintptr_t align4(uintptr_t a)
+/*
+ * Round an OFFSET inside the tree (not an address) up to 4 bytes. The FDT base
+ * itself may be unaligned, so aligning the absolute address would be wrong.
+ */
+static uint32_t align4(uint32_t off)
 {
-	return (a + 3) & ~3UL;
+	return (off + 3) & ~(uint32_t)3;
 }
 
 /*
@@ -63,7 +76,8 @@ static int chosen_prop(uintptr_t fdt, const char *prop, uintptr_t *val,
 		       uint32_t *len)
 {
 	uint32_t total, off_struct, off_strings, sz_strings;
-	uintptr_t end, p, strings, strings_end;
+	uintptr_t end, strings, strings_end;
+	uint32_t p;			/* offset into the tree, not an address */
 	unsigned tokens = 0;
 	int depth = 0, in_chosen = 0;
 
@@ -79,7 +93,7 @@ static int chosen_prop(uintptr_t fdt, const char *prop, uintptr_t *val,
 	if (off_struct >= total || off_strings >= total ||
 	    sz_strings > total - off_strings)
 		return 0;
-	p = fdt + off_struct;
+	p = off_struct;
 	strings = fdt + off_strings;
 	strings_end = strings + sz_strings;
 
@@ -87,17 +101,17 @@ static int chosen_prop(uintptr_t fdt, const char *prop, uintptr_t *val,
 		uint32_t tok;
 		long n;
 
-		if (p + 4 > end || ++tokens > FDT_MAX_TOKENS)
+		if (p + 4 > total || ++tokens > FDT_MAX_TOKENS)
 			return 0;
-		tok = be32(p);
+		tok = be32(fdt + p);
 		p += 4;
 		switch (tok) {
 		case FDT_BEGIN_NODE:
-			if ((n = str_len(p, end)) < 0)
+			if ((n = str_len(fdt + p, end)) < 0)
 				return 0;
 			depth++;
-			in_chosen = depth == 2 && str_eq(p, end, "chosen");
-			p = align4(p + (unsigned long)n + 1);
+			in_chosen = depth == 2 && str_eq(fdt + p, end, "chosen");
+			p = align4(p + (uint32_t)n + 1);
 			break;
 		case FDT_END_NODE:
 			if (in_chosen)
@@ -107,16 +121,16 @@ static int chosen_prop(uintptr_t fdt, const char *prop, uintptr_t *val,
 		case FDT_PROP: {
 			uint32_t plen, nameoff;
 
-			if (p + 8 > end)
+			if (p + 8 > total)
 				return 0;
-			plen = be32(p);
-			nameoff = be32(p + 4);
+			plen = be32(fdt + p);
+			nameoff = be32(fdt + p + 4);
 			/* value must lie inside the tree */
-			if (plen > end - (p + 8))
+			if (plen > total - (p + 8))
 				return 0;
 			if (in_chosen && nameoff < sz_strings &&
 			    str_eq(strings + nameoff, strings_end, prop)) {
-				*val = p + 8;
+				*val = fdt + p + 8;
 				*len = plen;
 				return 1;
 			}

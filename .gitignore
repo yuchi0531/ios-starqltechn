@@ -1,5 +1,7 @@
 # device dumps: persist/modemst/fsg hold IMEI + calibration; live DT holds the serial
 backup/
+# pulled partitions and KernelSU-patched boot images from the phone (device specifics)
+data/
 dtb/
 recovery/
 # third-party/Apple sources fetched for reading

@@ -156,7 +156,36 @@ Inspect an image without a phone:
 
 ```sh
 python3 tools/starq_mkboot.py --info starq-boot.img
+python3 tools/starq_mkboot.py --info data/boot.emmc.win.img   # a real stock image
+python3 tools/starq_mkboot.py --shape data/boot.emmc.win.img  # dtbh | appended | none
 ```
+
+### The two stock boot.img shapes
+
+`tools/starq_mkboot.py` probes the template and packs the matching shape; no
+flag selects it.
+
+| Stock shape | Header | DTBs live in | Packer |
+| --- | --- | --- | --- |
+| DTBH | `dt_size > 0`, dt section after the second stage | the dt section (Qualcomm `DTBH` table) | carried verbatim, or `--dtb FILE` |
+| Image.gz-dtb | `dt_size == 0`, no dt section | appended to the kernel blob, after the gzip stream | appended to our `Image`, or `--dtb-set DIR_OR_FILE` |
+
+The real starqltechn images (`data/boot.emmc.win.img`, and the
+KernelSU-patched one) are the second shape: page 4096, `kernel_addr=0x8000`,
+`ramdisk_addr=0x1000000`, `tags_addr=0x100`, `os_version=0x1a0001a2`, no
+`second`, and a kernel slot of gzip + **15 concatenated FDTs** (0xaa5e86 bytes)
+for 13 distinct `qcom,board-id` values Rev02..Rev14.
+
+For that shape the packer keeps `dt_size = 0` and writes
+`out_kernel = Image + dtb_set`, reusing the stock DTB bytes verbatim by default,
+so S-Boot's board-id selection is unchanged. The `Image` is our own loader and
+is **not** gzipped: S-Boot has no decompression to do, so raw `Image` + DTBs is
+the exact analogue of `Image.gz-dtb`.
+
+The trailer `id` is the AOSP v0 signature, SHA-1 over `kernel|ramdisk|second`,
+each followed by its u32 length; the dt section is not part of it. (The old
+README of this tool said dt was included — the real images disprove that; the
+dt form is only used when a dt section exists, as the legacy Samsung extension.)
 
 Measured artifacts on a Linux host (real kernel from CI, synthetic stock image):
 
@@ -344,7 +373,7 @@ is untouched and still produces the same `mkbootimg` command line.
 | `loader.ld` | Linked at 0, 32 KiB stack after `.bss`, no secondary stacks. |
 | `loader.c` | The S-Boot-specific loader (see below). |
 | `dsi.c` | DSI0 command-DMA transmit (`starq_dsi_dcs_write`), the panel probe from `/chosen/bootargs`, the `starqelvss=`/`starqmps=` parsers, the panel-aware default sequence and the read-only `DSI_CTRL` mode probe. See "Panel ELVSS override over DSI" above. |
-| `build.sh` | Compile + optional pack. `build.sh STOCK_BOOT.img PAYLOAD.bin OUT.img [DTBH.bin]`, packed by `tools/starq_mkboot.py`, so `mkbootimg` is not needed. |
+| `build.sh` | Compile + optional pack. `build.sh STOCK_BOOT.img PAYLOAD.bin OUT.img [DTBH.bin|FDT_DIR]`, packed by `tools/starq_mkboot.py`, so `mkbootimg` is not needed. |
 | `Makefile` | `make -C shim/starqltechn` builds and runs the host test. |
 
 ### What it does, in order

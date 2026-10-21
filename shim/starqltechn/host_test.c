@@ -490,6 +490,7 @@ int main(void)
 	printf("== DSI: panel probe from the bootloader cmdline\n");
 	{
 		char tok[96];
+		uint64_t rd_start;
 
 		/* fdt_chosen_str is the one new reader of bootloader input: it must
 		 * reject a bad magic, a truncated totalsize and an out-of-tree
@@ -517,6 +518,19 @@ int main(void)
 		check(fdt_chosen_str((uintptr_t)bad, "bootargs", tok, 4) == 1 &&
 		      strcmp(tok, "con") == 0,
 		      "a short buffer truncates rather than overrunning");
+
+		/* An Image.gz-dtb appends the DTBs to the kernel as an unpadded cat,
+		 * so the tree S-Boot hands over can start at an odd address (the
+		 * stock starqltechn set has a member at 0xb5c9d). With the MMU off
+		 * that makes an unaligned u32 load fault, and aligning absolute
+		 * addresses instead of in-tree offsets misparses the tree. */
+		build_fdt_args(bad + 1, 0x90000000UL, 0x90100000UL, BA_PX01);
+		check(fdt_chosen_str((uintptr_t)(bad + 1), "bootargs", full, sizeof(full)) &&
+		      strcmp(full, BA_PX01) == 0,
+		      "an odd-offset FDT parses: offsets align inside the tree, not as addresses");
+		check(fdt_chosen_u64((uintptr_t)(bad + 1), "linux,initrd-start", &rd_start) &&
+		      rd_start == 0x90000000UL,
+		      "the odd-offset tree yields the initrd start too");
 
 		check(starq_dsi_panel_from_cmdline(BA_PX01, tok, sizeof(tok)) ==
 		      STARQ_PANEL_PX01 &&

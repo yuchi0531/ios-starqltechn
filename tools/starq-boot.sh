@@ -6,9 +6,15 @@
 # Pipeline: mkadt.py -> mkpayload.py -> shim/build.sh (BOARD=starqltechn,
 # compiles the shim and calls tools/starq_mkboot.py) -> header check.
 #
-# STOCK_BOOT.img is the phone's own boot image (backup/starq/boot.img, see
-# tools/starq-flash.sh). It supplies the header S-Boot expects (addresses,
-# page size, os_version/patch level, name) and the DTBH dt section.
+# STOCK_BOOT.img is the phone's own boot image (data/boot.emmc.win.img or
+# backup/starq/boot.img, see tools/starq-flash.sh). It supplies the header
+# S-Boot expects (addresses, page size, os_version/patch level, name) and the
+# DTBs. The packer probes its shape, so either stock shape works:
+#   - a dt section holding a Qualcomm DTBH table (older stock/port images), or
+#   - Image.gz-dtb: dt_size 0, the DTBs appended to the kernel (what the
+#     starqltechn stock and ROM images are). Then the stock DTB set is appended
+#     to our Image, dt_size stays 0, and S-Boot's board-id selection is
+#     unchanged.
 #
 # There is no fastboot on this phone: the result is written to /dev/block/
 # by-name/boot from TWRP with tools/starq-flash.sh.
@@ -82,13 +88,32 @@ echo "== shim"
 # the caller asked for, and no mkbootimg is involved.
 BOARD=starqltechn PACK=0 bash "$repo/shim/build.sh" "$work/payload.bin"
 
-echo "== boot.img (stock header + DTBH from $stock)"
-# DTB_FILE=table.dtbh substitutes a different DTBH table for the stock one.
-# (No "${arr[@]}" on an empty array: that is an unbound variable in bash < 4.4
-# under `set -u`.)
+echo "== boot.img (stock header + DTBs from $stock)"
+# The packer probes the stock image and takes the right path itself:
+#   dt_size > 0        -> dt section is a DTBH table, carried verbatim
+#   dt_size == 0       -> kernel is Image.gz-dtb (gzip + appended FDTs), so the
+#                         DTBs are appended to our Image instead and dt_size
+#                         stays 0. Nothing extra is needed here.
+# DTB_FILE=... substitutes another table/set: a DTBH table for the first shape,
+# a file or directory of bare FDTs for the second (the packer picks --dtb or
+# --dtb-set and rejects the wrong one).
+shape=$(python3 "$repo/tools/starq_mkboot.py" --shape "$stock")
+case "$shape" in
+dtbh)     echo "   stock shape: DTBH dt section" ;;
+appended) echo "   stock shape: Image.gz-dtb (dt_size 0, appended FDTs); the packer" \
+               "appends the stock DTB set to our Image and keeps dt_size 0" ;;
+*)        echo "error: $stock is a boot.img v0 with neither a DTBH dt section nor DTBs" >&2
+          echo "       appended to its kernel; S-Boot would have no tree to boot with." >&2
+          echo "       Point STOCK_BOOT at the phone's own boot.img (see NOTES.md)." >&2
+          exit 1 ;;
+esac
 if [ -n "${DTB_FILE:-}" ]; then
+	# Same flag for both shapes, different meaning: a DTBH table vs an FDT set.
+	flag=--dtb
+	[ "$shape" = appended ] && flag=--dtb-set
+	echo "   substituting $DTB_FILE ($flag)"
 	python3 "$repo/tools/starq_mkboot.py" "$stock" "$work/Image" \
-		"$work/payload.bin" "$out" --dtb "$DTB_FILE"
+		"$work/payload.bin" "$out" "$flag" "$DTB_FILE"
 else
 	python3 "$repo/tools/starq_mkboot.py" "$stock" "$work/Image" \
 		"$work/payload.bin" "$out"

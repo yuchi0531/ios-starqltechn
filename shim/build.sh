@@ -4,14 +4,17 @@
 #                             Qualcomm ABL shim (shim.c)
 #   BOARD=starqltechn      -> shim/starqltechn/build.sh: the Samsung S-Boot
 #                             loader, packed into a boot.img v0 that reuses the
-#                             stock Samsung header and DTBH dt section
+#                             stock Samsung header and DTBs (a DTBH dt section
+#                             or an Image.gz-dtb kernel, whichever the stock
+#                             image has)
 # FB_* defaults are sweet's; a board overrides them through CFLAGS.
 #
 # Knobs for an external pipeline (tools/starq-boot.sh) on starqltechn:
 #   STOCK_BOOT=STOCK.img  pack with tools/starq_mkboot.py (header + dt source)
 #   IMG=OUT.img           where the packed image goes
 #   PACK=0                compile only; the caller packs
-#   DTB_FILE=DTBH.bin     use this DTBH table instead of the stock dt section
+#   DTB_FILE=DTBH.bin     use this DTBH table (dt-section stock images) or FDT
+#                         set (Image.gz-dtb stock images) instead of the stock DTBs
 set -euo pipefail
 cd "$(dirname "$0")"
 BOARD=${BOARD:-sweet}
@@ -52,13 +55,15 @@ if [ "$BOARD" = starqltechn ]; then
 		# STOCK_BOOT.img PAYLOAD.bin OUT.img [DTBH.bin]
 		OUT_DIR=out bash starqltechn/build.sh "$@"
 	elif [ -z "$STOCK_BOOT" ] || [ -z "${1:-}" ]; then
-		# Samsung header v0 with a Qualcomm DTBH dt section. There is no
-		# mkbootimg layout for it that matches the phone: use the stock image
-		# as the template, and a payload to put in it.
+		# Samsung header v0: use the stock image as the header/DTB donor and a
+		# payload. Either stock shape works (DTBH dt section or Image.gz-dtb;
+		# tools/starq_mkboot.py probes it). There is no mkbootimg layout for
+		# Samsung's header that matches the phone.
 		echo "error: BOARD=starqltechn packing needs STOCK_BOOT=STOCK.img" >&2
 		echo "       and the payload as \$1 (or: shim/build.sh STOCK PAYLOAD OUT)" >&2
-		echo "       (stock boot image: backup/starq/boot.img; tools/starq-boot.sh" >&2
-		echo "        passes both, tools/starq-flash.sh backup pulls the image)" >&2
+		echo "       (stock boot image: data/boot.emmc.win.img or backup/starq/boot.img;" >&2
+		echo "        tools/starq-boot.sh passes both, tools/starq-flash.sh backup" >&2
+		echo "        pulls the image)" >&2
 		exit 1
 	elif [ -n "${DTB_FILE:-}" ]; then
 		OUT_DIR=out bash starqltechn/build.sh \

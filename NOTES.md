@@ -2,6 +2,64 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-22: real stock boot.img is Image.gz-dtb; packer + loader fixed <<<
+
+The user pulled two **real** boot partitions off the S9 into `data/` (gitignored):
+`data/boot.emmc.win.img` and `data/kernelsu_next_patched_20260222_092506.img`, both
+64 MiB TWRP dumps of the same boot partition. They are boot.img **v0**, page 4096,
+`kernel_addr=0x8000`, `ramdisk_addr=0x1000000`, `tags_addr=0x100`, no `second`,
+`os_version=0x1a0001a2`, 16 zero `name` bytes, a real Android cmdline, trailer
+`SEANDROIDENFORCE` - and **`dt_size == 0`: there is no DTBH section at all.** The kernel
+slot is an **`Image.gz-dtb`**: gzip followed by **15 concatenated bare FDTs** for 13
+distinct `qcom,board-id` values (Rev02..Rev14, plus a second Rev13 and Rev14 for the
+`msm-id` 0x20001 variants):
+
+| # | model | `qcom,board-id` | `qcom,msm-id` |
+| --- | --- | --- | --- |
+| 1 | Rev08 | `0x8 0x8` | `0x141 0x20000` |
+| 2 | Rev12 | `0x8 0xc` | `0x141 0x20000` |
+| 3 | Rev10 | `0x8 0xa` | `0x141 0x20000` |
+| 4 | Rev14 | `0x8 0xe` | `0x141 0x20001` |
+| 5 | Rev09 | `0x8 0x9` | `0x141 0x10000` |
+| 6 | Rev11 | `0x8 0xb` | `0x141 0x20000` |
+| 7 | Rev06 | `0x8 0x6` | `0x141 0x20000` |
+| 8 | Rev14 | `0x8 0xe` | `0x141 0x20000` |
+| 9 | Rev04 | `0x8 0x4` | `0x141 0x10000` |
+| 10 | Rev07 | `0x8 0x7` | `0x141 0x10000` |
+| 11 | Rev03 | `0x8 0x3` | `0x141 0x10000` |
+| 12 | Rev05 | `0x8 0x5` | `0x141 0x10000` |
+| 13 | Rev02 | `0x8 0x2` | `0x141 0x10000` |
+| 14 | Rev13 | `0x8 0xd` | `0x141 0x20001` |
+| 15 | Rev13 | `0x8 0xd` | `0x141 0x20000` |
+
+**Facts measured, not guessed.** Kernel slot `0x18f93b4`; the gzip member ends at
+`0xe5352e` (decompresses to `0x2a5a820`); the remaining `0xaa5e86` bytes are the DTBs.
+Because the set is an **unpadded cat**, member #2 starts at `0xb5c9d` - an **odd**
+address. The `id` at 0x240 is SHA-1 over `kernel|ramdisk|second` + their u32 lengths;
+the dt section is *not* hashed (the old tool hashed it, which is why it printed STALE on
+these images).
+
+**Fixed.**
+- `tools/starq_mkboot.py`: a small FDT reader (no `dtc`); `--info` now prints the layout
+  and one `appended DTB #N` line per FDT; `--shape` prints `dtbh|appended|none`. `pack()`
+  probes the template: `dt_size == 0` + appended FDTs keeps `dt_size = 0` and writes
+  `out_kernel = Image + dtb_set`, reusing the stock DTB bytes verbatim (or
+  `--dtb-set DIR_OR_FILE`). The DTBH path still works unchanged. Refuses a set with zero
+  parseable FDTs, warns on a different board-id set. The id rule was corrected.
+- `shim/fdt.c`: **real bug found by this.** `be32()` did a plain `u32` load and the
+  in-tree offsets were aligned as absolute addresses. With the MMU off (Device memory) an
+  unaligned load faults, and the odd `0xb5c9d` offset is exactly what our packed image
+  reproduces. Now byte-wise `be32` and offsets aligned relative to the FDT base; the host
+  test covers an odd-offset tree.
+- `tools/starq-boot.sh` / `shim/build.sh` / `shim/starqltechn/build.sh`: probe the stock
+  shape, pick `--dtb` vs `--dtb-set` on their own, no new required flags.
+
+**Repack of the real template** (`data/boot.emmc.win.img` + real kernel + real payload):
+44,945,408 bytes, **fits** the 64 MiB partition with 22,163,456 bytes of slack; header
+identical except kernel/ramdisk size, cmdline and id; appended DTBs **byte-identical** to
+the stock ones; trailer `SEANDROIDENFORCE`; `dt_size == 0`; id valid. Full pipeline image
+(loader `Image` + payload) is 27,828,224 bytes.
+
 ### >>> UPDATE 2026-10-21: starqltechn ELVSS/green-screen fix (Magisk module ported into the drivers) <<<
 
 **Ask.** The user's S9 panel is physically degraded and shows a green tint. On Android
@@ -128,6 +186,9 @@ assertion measures the wrong side effect.
 | `make -C shim/starqltechn` | 174 host checks, 0 failures |
 | `python3 tools/validate-repo.py` | 83 patches contiguous 0001-0083 |
 | `tools/starq-boot.sh` end to end | 16,658,656-byte image, header intact, kernel SHA-1 verified, `SEANDROIDENFORCE` present (`/tmp/opencode/starq-ios-boot.img`, scratch) |
+| `tools/starq-boot.sh` with the **real** stock image | 27,828,224 bytes, `Image` + 15 stock DTBs, `dt_size 0`, id valid, 39,280,640 bytes of partition slack |
+| `python3 tools/starq_mkboot.py --info data/boot*.img` | 15 appended FDTs each, id valid (was: `dt (none)`, id STALE) |
+| repack of `data/boot.emmc.win.img` with the real kernel | 44,945,408 bytes; header/DTB/trailer/id verified; **fits** 64 MiB |
 
 Operational note: `/tmp` is a 5 GB tmpfs here and filled up during the artifact
 downloads; `/tmp/opencode/*` scratch trees need periodic cleanup or the boot-image step
