@@ -4,11 +4,14 @@
 /*
  * SDM845 DSI0 command-path TX (Galaxy S9, "starqltechn").
  *
- * S-Boot leaves MDSS + DSI0 + the S6E3HA8 panel powered, PLL-locked and
- * streaming in video mode. Nothing here initialises the link: it only sends
- * MIPI DCS packets through the DSI command DMA, which is an independent engine
- * from the video engine, and takes a read-only snapshot of everything it must
- * not disturb.
+ * S-Boot leaves MDSS, DSI0 and the S6E3HA8 panel powered and PLL-locked. What
+ * mode the panel is in is NOT assumed here: the vendor DTS declares both S9
+ * panels dsi_cmd_mode (dtsi_px01.dtsi:70, dtsi_mq01.dtsi:66), which is why
+ * starq_dsi_init() logs DSI_CTRL's enable/video/command bits and this code
+ * branches on the register rather than on the DT. Nothing here initialises the
+ * link: it only sends MIPI DCS packets through the DSI command DMA, which is an
+ * independent engine from the video engine, and takes a read-only snapshot of
+ * everything it must not disturb.
  *
  * Addresses from the vendor DT (arch/arm64/boot/dts/samsung/
  * sdm845-sec-starqlte-r14.dts, confirmed in the extracted
@@ -67,7 +70,30 @@ struct starq_dcs_seq {
  */
 int starq_dcs_parse(const char *s, struct starq_dcs_seq *out);
 
-/* Map-and-snapshot (read only) the controller and PHY registers. */
+/*
+ * Which S9 panel this unit has. The two panels take a different 4th byte in
+ * the 0xB5 ELVSS write (AMB577PX01: 0x16, AMB577MQ01: 0x0A), so it cannot be a
+ * constant.
+ */
+#define STARQ_PANEL_UNKNOWN	0
+#define STARQ_PANEL_PX01	1	/* AMB577PX01, dtsi_px01.dtsi */
+#define STARQ_PANEL_MQ01	2	/* AMB577MQ01, dtsi_mq01.dtsi */
+
+/*
+ * Which panel the bootloader configured, from the DTB's /chosen/bootargs:
+ * S-Boot passes its Linux command line there and the vendor display driver
+ * names the panel in it, e.g.
+ *   msm_drm.dsi_display0=ss_dsi_panel_S6E3HA8_AMB577PX01_WQHD:config0
+ * (dsi_display.c:7061-7064, matched against panel->name in
+ * ss_dsi_panel_common.c:4862-4876). `out` receives that raw token for the log,
+ * or an empty string when it is absent. Returns one of STARQ_PANEL_*.
+ */
+int starq_dsi_panel_from_cmdline(const char *bootargs, char *out,
+				 unsigned outlen);
+
+/* Map-and-snapshot (read only) the controller and PHY registers, and log the
+ * link mode. Clears the link-down flag when DSI_CTRL.ENABLE is set; when it is
+ * clear every later send is a no-op. */
 int starq_dsi_init(uintptr_t ctrl_pa, uintptr_t phy_pa);
 
 /*
@@ -82,6 +108,48 @@ int starq_dsi_dcs_write(const uint8_t *payload, unsigned len);
 
 /* Parse "spec" and send it. Logs as STARQ DSI: lines. 0 = at least one sent. */
 int starq_dsi_run(const char *spec);
+
+/*
+ * The ELVSS default policy. Mechanism, all from the vendor driver and its DTS:
+ *
+ *   - 0xB5 is a 24-byte page on PX01 and a 4-byte command on MQ01, but only
+ *     bytes 1..3 are what the driver ever computes; byte 23 on PX01 is a
+ *     per-panel OTP black-level trim that must be preserved, not synthesised.
+ *     So a 4-byte write is the universal move: it leaves PX01's bytes 4..23
+ *     (including that trim) untouched.
+ *   - 0xB5 sits in the level-1 protected bank (PX01's own gray-spot test
+ *     wraps it in F0 5A 5A / F0 A5 A5, dtsi_px01.dtsi:1905-1919, and
+ *     ss_elvss() sets *level_key = LEVEL1_KEY), so the write is bracketed by
+ *     the key.
+ *   - byte 1 (TSET) 0x8F = BIT(7) | 15 is the panel's -15 C compensation row,
+ *     which is what the Android Magisk module forces to kill the green tint.
+ *   - byte 2 (MPS) is 0xDC while the panel is above 39 cd.
+ *   - byte 3 (ELVSS offset) is 0x16 on PX01 and 0x0A on MQ01 (both DT's
+ *     index-0 entry).
+ *
+ * Sends "f0 5a 5a" / "b5 8f <mps> <elvss>" / "f0 a5 a5". Returns the number of
+ * commands sent, or -1.
+ */
+#define STARQ_ELVSS_TSET	0x8f	/* BIT(7) | 15 = -15 C */
+#define STARQ_ELVSS_MPS		0xdc	/* candela_level > 39 */
+#define STARQ_ELVSS_PX01	0x16
+#define STARQ_ELVSS_MQ01	0x0a
+/* Unknown panel: the PX01 value, because PX01 is the higher-volume starqlte
+ * panel and 0x16 is the larger (more compensated) of the two, so a wrong guess
+ * errs towards less green rather than more. */
+#define STARQ_ELVSS_UNKNOWN	STARQ_ELVSS_PX01
+
+int starq_dsi_default(int panel, unsigned mps);
+
+/* 1 when spec asks for the whole override to be off ("off"). */
+int starq_elvss_off(const char *spec);
+
+/*
+ * Apply the policy: spec == NULL/"" takes the default above, "off" does
+ * nothing, anything else is the starqelvss=<hex list> override (all or
+ * nothing). Returns the number of commands sent, or -1.
+ */
+int starq_dsi_elvss(const char *spec, int panel, unsigned mps);
 
 /* Register writes the driver performed, most recent transfer only. The host
  * test (host_test.c) verifies the register sequence from this; on aarch64 it is

@@ -2,10 +2,17 @@
  * SDM845 / DSI0 command-path transmit for starqltechn (Galaxy S9).
  *
  * S-Boot hands over a live link: MDSS, DSI0, the PLL and the S6E3HA8 panel are
- * powered and the video engine is streaming. This file therefore does not
- * initialise anything. It only pushes MIPI DCS packets through the DSI command
- * DMA, which is a separate engine from the video engine, and it reads (never
- * writes) every register that belongs to timing, the PHY or the clock tree.
+ * powered and PLL-locked. This file therefore does not initialise anything. It
+ * only pushes MIPI DCS packets through the DSI command DMA, which is a separate
+ * engine from the video engine, and it reads (never writes) every register that
+ * belongs to timing, the PHY or the clock tree.
+ *
+ * Whether the panel is in video or command mode is NOT assumed: both S9 panels
+ * are declared dsi_cmd_mode in the vendor DTS (dtsi_px01.dtsi:70,
+ * dtsi_mq01.dtsi:66), which contradicts what an earlier version of this file
+ * and NOTES.md said. DSI_CTRL's ENABLE / VIDEO_MODE_EN / CMD_MODE_EN bits are
+ * the deciding evidence, so starq_dsi_init() logs them and every DMA-scheduling
+ * decision below reads the register instead of the DT.
  *
  * ---- register file ----
  * The offsets below are the vendor techpack's absolute offsets
@@ -68,21 +75,39 @@
  * command longer than one pixel line (hdisplay*bpp/8 = 4320 bytes at 1440 px,
  * 24 bpp), since in video mode a command only goes out during BLLP.
  *
- * The techpack driver does something stronger, and this is what we implement:
- * for controller version >= 2.2 (SDM845 is "qcom,dsi-ctrl-hw-v2.2" ->
- * DSI_CTRL_VERSION_2_2) dsi_ctrl_wait_for_video_done() returns immediately
- * *because* dsi_ctrl_hw_22_schedule_dma_cmd() has programmed
- * DSI_DMA_SCHEDULE_CTRL, so the hardware emits the DMA command itself at the
- * configured scan line. dsi_message_tx() computes that line as
- * v_back_porch + v_sync_width + v_active, which is exactly the "active_v end"
- * field of DSI_VIDEO_MODE_ACTIVE_V (dsi_ctrl_hw_cmn_setup_video_mode():
- * active_v_end = v_sync_width + v_back_porch + v_active). We therefore derive
- * the line from that read-only register: the first line of vertical blanking.
- * Nothing is hardcoded from the panel's DT timing.
+ * The techpack driver does something stronger, and this is what we implement
+ * *when DSI_CTRL says video mode*: for controller version >= 2.2 (SDM845 is
+ * "qcom,dsi-ctrl-hw-v2.2" -> DSI_CTRL_VERSION_2_2)
+ * dsi_ctrl_wait_for_video_done() returns immediately *because*
+ * dsi_ctrl_hw_22_schedule_dma_cmd() has programmed DSI_DMA_SCHEDULE_CTRL, so
+ * the hardware emits the DMA command itself at the configured scan line.
+ * dsi_message_tx() computes that line as v_back_porch + v_sync_width + v_active,
+ * which is exactly the "active_v end" field of DSI_VIDEO_MODE_ACTIVE_V
+ * (dsi_ctrl_hw_cmn_setup_video_mode(): active_v_end = v_sync_width +
+ * v_back_porch + v_active). We therefore derive the line from that read-only
+ * register: the first line of vertical blanking. Nothing is hardcoded from the
+ * panel's DT timing. In command mode the trigger is the frame update and there
+ * is nothing to dodge, so no schedule is programmed (neither does the vendor
+ * driver program one when the panel is in command mode).
  *
  * starqdsisw=1 in the boot-args skips the schedule and uses the plain software
  * trigger, i.e. mainline's "send whenever the DMA engine is idle" behaviour,
  * for experiments.
+ *
+ * ---- the ELVSS payload ----
+ * See dsi.h for the mechanism and its sources. In short: 0xB5 is NOT readable
+ * as a page. The vendor DT exposes a 2-byte read at a 0xB0-selected offset
+ * (samsung,elvss_rx_cmds_revA = [06 01 00 00 00 00 01 B5 02 16], i.e. rx_len=2,
+ * read_startoffset 0x16 on PX01 / 0x17 on MQ01; dsi_panel.c:2113-2114). There
+ * is therefore no read-modify-write here and no DCS read at all: only 2 bytes
+ * are exposed, a paginated read would need three passes plus BTA handling, and
+ * that is not worth the risk on an unproven link. A 4-byte 0xB5 write is the
+ * correct universal move instead: it changes exactly the bytes the vendor
+ * driver changes (1..3) and on PX01 leaves bytes 4..23 - including the
+ * per-panel OTP black-level trim in byte 23 - untouched.
+ *
+ * If a read ever becomes necessary, DCS 0xD6 + a 0xB0 page select is the path
+ * the vendor driver uses; that is future work, not this.
  */
 #include "dsi.h"
 #include "loader.h"
@@ -102,6 +127,7 @@
 #define R_ACK_ERR_STATUS	0x068
 #define R_TRIG_CTRL		0x084
 #define R_TRIG_DMA		0x090
+#define R_TIMEOUT_STATUS	0x0c0
 #define R_DMA_SCHED		0x100
 #define R_ERR_INT_MASK0		0x10c
 #define R_INT_CTRL		0x110
@@ -171,6 +197,7 @@ static uintptr_t dsi_ctrl, dsi_phy;
 static uintptr_t dsi_cmd_pa;	/* physical address the DMA engine reads */
 static int dsi_inited;
 static int dsi_sw_trigger;
+static int dsi_link_down;	/* DSI_CTRL.ENABLE was clear: send nothing */
 
 /* ---- the DMA-visible packet buffer ----
  * The MMU is off in the loader, so the address the DSI DMA reads is physical,
@@ -260,6 +287,21 @@ static void reg_row(uintptr_t base, const char *n0, uint32_t o0,
 	starq_out("\n");
 }
 
+/* Exactly eight hex digits plus a trailing space: the log line is meant to be
+ * pasted next to the vendor register dump, where "0x000001b3" and "0x1b3" are
+ * not the same thing when you are looking for a bit. */
+static void hex8(uint32_t v)
+{
+	static const char digits[] = "0123456789abcdef";
+	char b[12] = "0x";
+
+	for (int i = 0; i < 8; i++)
+		b[2 + i] = digits[(v >> (28 - 4 * i)) & 0xf];
+	b[10] = ' ';
+	b[11] = 0;
+	starq_out(b);
+}
+
 /* Log a polled value only when it changes: "every register poll result"
  * without filling the 256 KB ramoops zone with the same word 200k times. */
 static void poll_log(uint32_t n, uint32_t val, uint32_t *last)
@@ -288,6 +330,7 @@ int starq_dsi_init(uintptr_t ctrl_pa, uintptr_t phy_pa)
 	dsi_cmd_pa = (uintptr_t)starq_dsi_cmd_buf;
 #endif
 	dsi_inited = 0;
+	dsi_link_down = 1;		/* until DSI_CTRL proves otherwise */
 	if (!ctrl_pa || !phy_pa) {
 		starq_out("STARQ DSI: no controller address, TX disabled\n");
 		return -1;
@@ -301,17 +344,33 @@ int starq_dsi_init(uintptr_t ctrl_pa, uintptr_t phy_pa)
 	starq_hex(dsi_cmd_pa);
 	starq_out("\n");
 
-	starq_out("STARQ DSI: ");
-	reg_row(dsi_ctrl, "hwver", R_HW_VERSION, "ctrl", R_CTRL,
-		"status", R_STATUS);
-
+	/*
+	 * The mode probe. This is the single most important line this file
+	 * prints: both S9 panels are dsi_cmd_mode in the vendor DTS, so a
+	 * bootloader that leaves DSI0 in command mode means the framebuffer at
+	 * FB_BASE is NOT what is on the panel and MDSS's write_memory_start
+	 * (plus a full DSI bring-up) is mandatory rather than optional.
+	 * Read only: nothing here is ever written.
+	 */
 	ctrl = rd32(dsi_ctrl, R_CTRL);
-	starq_out("STARQ DSI: mode=");
-	starq_out((ctrl & CTRL_VID_MODE_EN) ? "video" :
-		  (ctrl & CTRL_CMD_MODE_EN) ? "command" : "off");
-	starq_kv(" cmd_en", (ctrl & CTRL_CMD_MODE_EN) ? 1 : 0);
-	starq_kv("ena", (ctrl & CTRL_ENABLE) ? 1 : 0);
+	starq_out("STARQ DSI: DSI_CTRL=");
+	hex8(ctrl);
+	starq_out("en=");
+	starq_out((ctrl & CTRL_ENABLE) ? "1" : "0");
+	starq_out(" video=");
+	starq_out((ctrl & CTRL_VID_MODE_EN) ? "1" : "0");
+	starq_out(" cmd=");
+	starq_out((ctrl & CTRL_CMD_MODE_EN) ? "1" : "0");
+	starq_out(" hwver=");
+	hex8(rd32(dsi_ctrl, R_HW_VERSION));
+	starq_kv("status", rd32(dsi_ctrl, R_STATUS));
 	starq_kv("lanes", (ctrl >> 4) & 0xf);
+	starq_out("\n");
+
+	starq_out("STARQ DSI: ack_err=");
+	hex8(rd32(dsi_ctrl, R_ACK_ERR_STATUS));
+	starq_out("timeout=");
+	hex8(rd32(dsi_ctrl, R_TIMEOUT_STATUS));
 	starq_out("\n");
 
 	/* Video timing: read-only, for the log and for the schedule line. */
@@ -357,6 +416,31 @@ int starq_dsi_init(uintptr_t ctrl_pa, uintptr_t phy_pa)
 			   : "STARQ DSI: refgen NOT ready, link may be down\n");
 	if (intc & INT_CTRL_ERROR)
 		starq_out("STARQ DSI: error bit already latched\n");
+
+	/*
+	 * What mode the panel is in, in plain words, because this decides the
+	 * whole display plan. DSI_CTRL.ENABLE clear means the link is down and
+	 * every later send below becomes a no-op instead of a 200k-iteration
+	 * poll against a dead controller.
+	 */
+	if (!(ctrl & CTRL_ENABLE)) {
+		starq_out("STARQ DSI: LINK DOWN (DSI_CTRL.ENABLE=0), "
+			  "no command will be sent\n");
+		dsi_inited = 1;
+		return 0;
+	}
+	dsi_link_down = 0;
+	if (ctrl & CTRL_VID_MODE_EN) {
+		starq_out("STARQ DSI: panel in VIDEO mode: the bootloader "
+			  "framebuffer is being scanned out\n");
+	} else if (ctrl & CTRL_CMD_MODE_EN) {
+		starq_out("STARQ DSI: panel in COMMAND mode (vendor DT agrees, "
+			  "dsi_cmd_mode): FB_BASE is NOT on screen unless MDSS "
+			  "push/write_memory_start is programmed\n");
+	} else {
+		starq_out("STARQ DSI: neither video nor command mode set in "
+			  "DSI_CTRL; display path unknown\n");
+	}
 	dsi_inited = 1;
 	return 0;
 }
@@ -364,6 +448,76 @@ int starq_dsi_init(uintptr_t ctrl_pa, uintptr_t phy_pa)
 void starq_dsi_set_sw_trigger(int on)
 {
 	dsi_sw_trigger = on;
+}
+
+/* ---- which panel is this ---- */
+
+/* strstr, because there is no libc here. */
+static int contains(const char *hay, const char *needle)
+{
+	for (; *hay; hay++) {
+		const char *h = hay, *n = needle;
+
+		while (*h && *n && *h == *n)
+			h++, n++;
+		if (!*n)
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * The bootloader names the panel in its own command line, which it puts in the
+ * DTB's /chosen/bootargs; the vendor display driver parses the same string
+ * (dsi_display.c:7061-7064) and matches the node name against panel->name
+ * (ss_dsi_panel_common.c:4862-4876). Free of risk: it is a string S-Boot
+ * already wrote, and reading it means no display register is touched.
+ */
+int starq_dsi_panel_from_cmdline(const char *bootargs, char *out,
+				 unsigned outlen)
+{
+	static const char key[] = "msm_drm.dsi_display0=";
+	const char *p, *v = 0;
+	unsigned n = 0;
+
+	if (out && outlen)
+		out[0] = 0;
+	if (!bootargs)
+		return STARQ_PANEL_UNKNOWN;
+
+	/* Token start only, and the key must start the token: the vendor
+	 * property is a kernel module parameter, so "nosomethingmsm_drm..." and
+	 * a mid-token lookalike must not match. */
+	for (p = bootargs; *p; p++) {
+		const char *k = key, *q;
+
+		if (p != bootargs && p[-1] != ' ')
+			continue;
+		for (q = p; *k && *q == *k; q++, k++)
+			;
+		if (!*k) {
+			v = q;		/* just past the '=' */
+			break;
+		}
+	}
+	if (!v)
+		return STARQ_PANEL_UNKNOWN;
+
+	/* The raw token, up to the space that ends it: the log line then reads
+	 * "panel=PX01 name=ss_dsi_panel_S6E3HA8_AMB577PX01_WQHD:config0". */
+	while (v[n] && v[n] != ' ' && n + 1 < outlen) {
+		if (out)
+			out[n] = v[n];
+		n++;
+	}
+	if (out)
+		out[n] = 0;
+
+	if (out && contains(out, "AMB577PX01"))
+		return STARQ_PANEL_PX01;
+	if (out && contains(out, "AMB577MQ01"))
+		return STARQ_PANEL_MQ01;
+	return STARQ_PANEL_UNKNOWN;
 }
 
 /* ---- boot-arg parsing: "b5,8f,dc,0a" / "f0,5a,5a;b5,8f,dc,0a" ---- */
@@ -624,6 +778,10 @@ int starq_dsi_dcs_write(const uint8_t *payload, unsigned len)
 		starq_out("STARQ DSI: not initialised, command dropped\n");
 		return -1;
 	}
+	if (dsi_link_down) {
+		starq_out("STARQ DSI: link down, command dropped\n");
+		return -1;
+	}
 	if (!payload || !len || len > STARQ_DCS_MAX_LEN) {
 		starq_out("STARQ DSI: bad DCS length ");
 		starq_kv("len", len);
@@ -672,16 +830,43 @@ int starq_dsi_dcs_write(const uint8_t *payload, unsigned len)
 	return 0;
 }
 
-int starq_dsi_run(const char *spec)
+/* Send a parsed sequence in order, stopping at the first failure. */
+static int send_seq(const struct starq_dcs_seq *seq)
 {
-	struct starq_dcs_seq seq;
 	int sent = 0;
 
 	if (!dsi_inited) {
 		starq_out("STARQ DSI: not initialised, sequence dropped\n");
 		return -1;
 	}
-	if (!spec || !*spec)		/* no boot-arg: send nothing */
+	if (dsi_link_down) {
+		starq_out("STARQ DSI: link down, sequence dropped\n");
+		return -1;
+	}
+	starq_out("STARQ DSI: sequence ");
+	starq_kv("cmds", seq->n);
+	starq_out("\n");
+	for (unsigned i = 0; i < seq->n; i++) {
+		if (starq_dsi_dcs_write(seq->cmd[i].data, seq->cmd[i].len)) {
+			starq_out("STARQ DSI: stopped at command ");
+			starq_kv("n", i);
+			starq_out("\n");
+			return -1;
+		}
+		sent++;
+	}
+	return sent;
+}
+
+int starq_dsi_run(const char *spec)
+{
+	struct starq_dcs_seq seq;
+
+	if (!dsi_inited) {
+		starq_out("STARQ DSI: not initialised, sequence dropped\n");
+		return -1;
+	}
+	if (!spec || !*spec)		/* nothing to send */
 		return 0;
 	if (starq_dcs_parse(spec, &seq)) {
 		starq_out("STARQ DSI: bad hex list \"");
@@ -692,18 +877,76 @@ int starq_dsi_run(const char *spec)
 		starq_out("\": nothing sent\n");
 		return -1;
 	}
+	return send_seq(&seq);
+}
 
-	starq_out("STARQ DSI: sequence ");
-	starq_kv("cmds", seq.n);
-	starq_out("\n");
-	for (unsigned i = 0; i < seq.n; i++) {
-		if (starq_dsi_dcs_write(seq.cmd[i].data, seq.cmd[i].len)) {
-			starq_out("STARQ DSI: stopped at command ");
-			starq_kv("n", i);
-			starq_out("\n");
-			return -1;
-		}
-		sent++;
+/* The default sequence: level-1 key on, one 4-byte 0xB5, level-1 key off. */
+int starq_dsi_default(int panel, unsigned mps)
+{
+	struct starq_dcs_seq seq;
+	unsigned elvss = panel == STARQ_PANEL_MQ01 ? STARQ_ELVSS_MQ01
+						  : STARQ_ELVSS_UNKNOWN;
+	unsigned n = 0;
+
+	seq.cmd[n].data[0] = 0xf0;
+	seq.cmd[n].data[1] = 0x5a;
+	seq.cmd[n].data[2] = 0x5a;
+	seq.cmd[n].len = 3;
+	n++;
+	seq.cmd[n].data[0] = 0xb5;
+	seq.cmd[n].data[1] = STARQ_ELVSS_TSET;
+	seq.cmd[n].data[2] = (uint8_t)mps;
+	seq.cmd[n].data[3] = (uint8_t)elvss;
+	seq.cmd[n].len = 4;
+	n++;
+	seq.cmd[n].data[0] = 0xf0;
+	seq.cmd[n].data[1] = 0xa5;
+	seq.cmd[n].data[2] = 0xa5;
+	seq.cmd[n].len = 3;
+	n++;
+	seq.n = n;
+	return send_seq(&seq);
+}
+
+/* "off": the whole override disabled - nothing parsed, nothing sent. */
+int starq_elvss_off(const char *spec)
+{
+	return spec && spec[0] == 'o' && spec[1] == 'f' && spec[2] == 'f' &&
+	       spec[3] == 0;
+}
+
+/*
+ * The policy, in one place so the loader and the kernel side can be read
+ * against each other: an explicit boot-arg wins, "off" disables, and an absent
+ * boot-arg means the panel-aware default runs (the override is on by default
+ * because the green tint is the reason this code exists).
+ */
+int starq_dsi_elvss(const char *spec, int panel, unsigned mps)
+{
+	if (starq_elvss_off(spec)) {
+		starq_out("STARQ DSI: starqelvss=off, override disabled\n");
+		return 0;
 	}
-	return sent;
+	if (spec && *spec) {
+		/* A starqelvss= boot-arg, or a non-empty STARQ_ELVSS_DEFAULT
+		 * baked in at build time: both mean "use these bytes as given". */
+		starq_out("STARQ DSI: explicit sequence from the boot-arg/compiled"
+			  " default\n");
+		return starq_dsi_run(spec);
+	}
+
+	starq_out("STARQ DSI: default policy, panel=");
+	starq_out(panel == STARQ_PANEL_PX01 ? "PX01" :
+		  panel == STARQ_PANEL_MQ01 ? "MQ01" : "UNKNOWN");
+	starq_kv("mps", mps);
+	starq_kv("elvss", panel == STARQ_PANEL_MQ01 ? STARQ_ELVSS_MQ01
+						    : STARQ_ELVSS_UNKNOWN);
+	starq_out("\n");
+	if (panel == STARQ_PANEL_UNKNOWN)
+		starq_out("STARQ DSI: no AMB577 panel name in the bootloader "
+			  "cmdline, assuming PX01: it is the higher-volume "
+			  "starqlte panel and 0x16 is the more compensated "
+			  "of the two, so a wrong guess errs towards less "
+			  "green\n");
+	return starq_dsi_default(panel, mps);
 }

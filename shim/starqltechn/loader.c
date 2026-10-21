@@ -34,11 +34,16 @@
  *                      e.g. starqwin=0xA2000000:0x18000000. Only the accepted
  *                      window changes: the payload's phys_base/mem_size from
  *                      the ADT stay authoritative for the copies.
- *   starqelvss=LIST    send these DCS writes to the panel over DSI0 before
- *                      jumping to XNU, e.g. starqelvss=b5,8f,dc,0a or
- *                      starqelvss=f0,5a,5a;b5,8f,dc,0a. Bytes are hex, ','.
+ *   starqelvss=LIST    override the panel ELVSS write. LIST is a DCS hex list,
+ *                      e.g. starqelvss=b5,8f,dc,0a or
+ *                      starqelvss=f0,5a,5a;b5,8f,dc,0a: bytes are hex, ','
  *                      separates the bytes of one command, ';' the commands.
- *                      Absent -> nothing is sent (see STARQ_ELVSS_DEFAULT).
+ *                      starqelvss=off disables the override entirely. Absent ->
+ *                      the panel-aware default (see STARQ_ELVSS_*), which is
+ *                      ON: level-1 key, "b5 8f dc <elvss>", level-1 key off.
+ *   starqmps=VAL       byte 2 (MPS) of the default 0xB5 write, 1-2 hex digits.
+ *                      Default 0xdc, which is what the vendor driver uses above
+ *                      39 cd; 0xcc below that.
  *   starqdsisw=1       trigger the command DMA immediately instead of
  *                      scheduling it into the vertical blanking window.
  */
@@ -124,23 +129,42 @@
  * question of the port - does this bootloader leave the display scanning out of
  * the buffer at FB_BASE (CPU copies reach the panel, as on sweet), or is the
  * panel in command mode with its own GRAM (nothing we write shows up and MDSS/
- * DSI has to be programmed)? Build with -DSTARQ_FB_TEST=0 or pass starqfb=0 to
- * turn it off. */
+ * DSI has to be programmed)? The vendor DTS says both S9 panels are
+ * dsi_cmd_mode, so the second answer is the likely one; the DSI_CTRL line the
+ * loader prints is the deciding evidence either way. Build with
+ * -DSTARQ_FB_TEST=0 or pass starqfb=0 to turn the pattern off. */
 #ifndef STARQ_FB_TEST
 #define STARQ_FB_TEST		1
 #endif
 
-/* Panel ELVSS override, sent over DSI after the test pattern and before the
- * jump to XNU (see dsi.c). EMPTY means "send nothing": the boot-arg
- * starqelvss=<hex list> is then the only way to send anything, which is the
- * right default because a wrong 0xB5 leaves the panel with a bad black level
- * until the next reboot. To bake a value into an image, build with
- *   CFLAGS_EXTRA='-DSTARQ_ELVSS_DEFAULT="b5,8f,dc,0a"'
- * The format is the boot-arg's: comma-separated bytes, commands separated by
- * ';'. The value another agent computes for the degraded panel goes here. */
+/* Panel ELVSS override, sent over DSI after the mode probe and before the jump
+ * to XNU (see dsi.c and STARQ_ELVSS_* in dsi.h). ON by default and panel-aware:
+ *
+ *   f0 5a 5a              level-1 key: 0xB5 is in the protected bank
+ *   b5 8f dc <elvss>      TSET 0x8f (-15 C), MPS 0xdc, ELVSS offset
+ *   f0 a5 a5              level-1 key off
+ *
+ * with <elvss> = 0x16 on AMB577PX01 and 0x0a on AMB577MQ01, from the panel name
+ * in the DTB's /chosen/bootargs. An unknown panel gets the PX01 value (see
+ * dsi.h for why). starqelvss=<hex list> overrides all of it and
+ * starqelvss=off disables it.
+ *
+ * STARQ_ELVSS_DEFAULT is only for baking a *specific* sequence into an image
+ * instead; leave it empty for the policy above. */
 #ifndef STARQ_ELVSS_DEFAULT
 #define STARQ_ELVSS_DEFAULT	""
 #endif
+/* MPS (byte 2): 0xdc above 39 cd, 0xcc below (ss_elvss() in the vendor driver).
+ * starqmps=<1-2 hex digits> overrides it. */
+#ifndef STARQ_ELVSS_MPS_DEFAULT
+#define STARQ_ELVSS_MPS_DEFAULT	STARQ_ELVSS_MPS
+#endif
+
+/* /chosen/bootargs is S-Boot's Linux command line; a few hundred bytes are
+ * typical, and the panel token is ~64. Sized for the log, not for the longest
+ * possible string. */
+#define STARQ_BOOTARGS_MAX	512
+#define STARQ_PANEL_TOKEN_MAX	96
 
 /* Cache maintenance and barriers mean nothing on the host, where
  * shim/starqltechn/host_test.c links this file to actually run the validation
@@ -490,6 +514,41 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr,
 	if (pattern)
 		fb_pattern();
 
+	/*
+	 * Panel probe, straight after the pattern and before the payload is even
+	 * validated: it costs one string in the DTB, touches no register, and it
+	 * is the answer to "which of the two S9 panels is in this unit" for
+	 * every later step and for the log if the boot fails from here on.
+	 *
+	 * The identity comes from the DTB's /chosen/bootargs - S-Boot's own
+	 * command line, not our payload cmdline - because that is where the
+	 * vendor display driver reads msm_drm.dsi_display0=<panel node>:config0
+	 * (dsi_display.c:7061-7064). The payload cmdline says nothing about the
+	 * panel.
+	 */
+	char bootargs[STARQ_BOOTARGS_MAX];
+	char panel_token[STARQ_PANEL_TOKEN_MAX];
+	int panel;
+
+	if (fdt_chosen_str(dtb, "bootargs", bootargs, sizeof(bootargs))) {
+		out("STARQ DSI: bootloader cmdline: ");
+		out(bootargs);
+		out("\n");
+	} else {
+		out("STARQ DSI: no /chosen/bootargs in the DTB\n");
+		bootargs[0] = 0;
+	}
+	panel = starq_dsi_panel_from_cmdline(bootargs, panel_token,
+					    sizeof(panel_token));
+	out("STARQ DSI: panel=");
+	out(panel == STARQ_PANEL_PX01 ? "PX01" :
+	    panel == STARQ_PANEL_MQ01 ? "MQ01" : "UNKNOWN");
+	if (panel_token[0]) {
+		out(" name=");
+		out(panel_token);
+	}
+	out("\n");
+
 	/* S-Boot puts the BOOT ramdisk in the low 4 GB bank; only 0x80000000..4G is
 	 * DRAM on this board. */
 	uint64_t rd_start, rd_end;
@@ -616,30 +675,45 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr,
 	}
 	out("\n");
 
-	/* Panel ELVSS override over DSI. S-Boot leaves the DSI link up, so the
-	 * panel's own registers can be written without an MDSS driver; see
-	 * dsi.c for the register sequence and what is deliberately left alone.
-	 * Nothing is sent unless the boot-arg is there (or a compiled default
-	 * was set), because a wrong 0xB5 leaves the panel with a bad black
-	 * level until the next reboot.
+	/* Step: the DSI mode probe, then the ELVSS override. S-Boot leaves the
+	 * DSI link up, so the panel's own registers can be written without an
+	 * MDSS driver; see dsi.c for the register sequence and what is
+	 * deliberately left alone.
 	 *
-	 * The registers are not even read when there is nothing to send: a
-	 * read of an unclocked MDSS block can hang the interconnect on
-	 * Qualcomm, and that would cost an Odin flash. The snapshot is
-	 * diagnostics for a transfer we are about to attempt. */
+	 * The DSI_CTRL probe runs even with starqelvss=off, and that is a
+	 * deliberate risk: it is read-only, S-Boot leaves MDSS clocked, and the
+	 * enable/video/command bits are the deciding evidence for the whole
+	 * display plan (a read of an *unclocked* MDSS block can hang the
+	 * interconnect on Qualcomm, which would cost an Odin flash). If that
+	 * ever happens, starqelvss=off is the switch that must become "no
+	 * register access at all" again.
+	 *
+	 * Every step here logs and continues: a display experiment must never
+	 * stop XNU from starting. */
 	{
 		const char *elvss = arg_val(p->cmdline, "starqelvss=");
+		const char *mps_arg = arg_val(p->cmdline, "starqmps=");
 		const char *spec = elvss ? elvss : STARQ_ELVSS_DEFAULT;
+		unsigned mps = STARQ_ELVSS_MPS_DEFAULT;
+		uint64_t v;
 
-		if (!elvss && !spec[0]) {
-			out("STARQ DSI: no starqelvss, DSI0 left alone\n");
-		} else if (starq_dsi_init(STARQ_DSI_CTRL_PA,
-					  STARQ_DSI_PHY_PA) == 0) {
+		if (mps_arg && parse_hex(mps_arg, &v) && v <= 0xff)
+			mps = (unsigned)v;
+		else if (mps_arg)
+			out("STARQ DSI: bad starqmps, using 0xdc\n");
+
+		if (starq_dsi_init(STARQ_DSI_CTRL_PA, STARQ_DSI_PHY_PA) != 0)
+			out("STARQ DSI: controller not probed\n");
+
+		if (starq_elvss_off(spec)) {
+			out("STARQ DSI: starqelvss=off, nothing sent\n");
+		} else {
 			if (arg_val(p->cmdline, "starqdsisw=1"))
 				starq_dsi_set_sw_trigger(1);
-			out(elvss ? "STARQ DSI: starqelvss from cmdline\n"
-				  : "STARQ DSI: starqelvss from the compiled default\n");
-			if (starq_dsi_run(spec) < 0)
+			/* The boot-arg wins; otherwise spec is the compiled
+			 * default, which is empty by default so the policy in
+			 * starq_dsi_elvss() picks the per-panel value. */
+			if (starq_dsi_elvss(spec, panel, mps) < 0)
 				out("STARQ DSI: override not applied\n");
 		}
 	}

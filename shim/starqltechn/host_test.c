@@ -24,6 +24,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/mman.h>
+#include "../fdt.h"
 #include "dsi.h"
 #include "loader.h"
 
@@ -72,13 +73,27 @@ static void *map_pa(unsigned long pa, unsigned long size)
 	return p;
 }
 
-/* ---- flattened device tree: root + /chosen/linux,initrd-{start,end} ---- */
-static size_t build_fdt(unsigned char *buf, uint64_t rd_start, uint64_t rd_end)
+/* ---- flattened device tree: root + /chosen/{bootargs,linux,initrd-*} ----
+ *
+ * The bootargs property is what S-Boot's own command line arrives in, and the
+ * panel probe reads it, so the test has to be able to put an arbitrary string
+ * there - including a very long one, to prove the bounds checks hold. */
+#define S_INITRD_START	"linux,initrd-start"
+#define S_INITRD_END	"linux,initrd-end"
+#define S_BOOTARGS	"bootargs"
+/* Offsets into the strings block, computed rather than hand-counted. */
+#define OFF_INITRD_END	(sizeof(S_INITRD_START))
+#define OFF_BOOTARGS	(sizeof(S_INITRD_START) + sizeof(S_INITRD_END))
+
+static size_t build_fdt_args(unsigned char *buf, uint64_t rd_start,
+			     uint64_t rd_end, const char *bootargs)
 {
-	static const char strings[] = "linux,initrd-start\0linux,initrd-end\0";
+	static const char strings[] = S_INITRD_START "\0" S_INITRD_END "\0"
+				      S_BOOTARGS "\0";
 	const size_t strings_len = sizeof(strings) - 1;
 	size_t p = 40;
 	uint32_t *h = (uint32_t *)buf;
+	size_t blen = bootargs ? strlen(bootargs) + 1 : 0;
 
 #define TOK(v) do { uint32_t t_ = __builtin_bswap32(v); memcpy(buf + p, &t_, 4); p += 4; } while (0)
 #define NAME(s) do { size_t n_ = strlen(s) + 1; memcpy(buf + p, s, n_); \
@@ -86,16 +101,22 @@ static size_t build_fdt(unsigned char *buf, uint64_t rd_start, uint64_t rd_end)
 #define V64(v) do { unsigned char d_[8]; \
 	for (int i_ = 0; i_ < 8; i_++) d_[i_] = (unsigned char)((v) >> (56 - 8 * i_)); \
 	TOK(3); TOK(8); TOK(nameoff_); memcpy(buf + p, d_, 8); p += 8; } while (0)
+#define STR(s, n) do { size_t l_ = (n); \
+	memcpy(buf + p, s, l_); p += (l_ + 3) & ~(size_t)3; } while (0)
 
 	size_t nameoff_ = 0;
 	(void)nameoff_;
 
 	TOK(1); NAME("");
 	TOK(1); NAME("chosen");
-	nameoff_ = 0;
 	V64(rd_start);
-	nameoff_ = 19;
+	nameoff_ = OFF_INITRD_END;
 	V64(rd_end);
+	if (blen) {
+		nameoff_ = OFF_BOOTARGS;
+		TOK(3); TOK((uint32_t)blen); TOK(nameoff_);
+		STR(bootargs, blen);
+	}
 	TOK(2);
 	TOK(2);
 	TOK(9);
@@ -116,10 +137,18 @@ static size_t build_fdt(unsigned char *buf, uint64_t rd_start, uint64_t rd_end)
 #undef TOK
 #undef NAME
 #undef V64
+#undef STR
 	return p;
 }
 
-static unsigned char fdt[512];
+static size_t build_fdt(unsigned char *buf, uint64_t rd_start, uint64_t rd_end)
+{
+	return build_fdt_args(buf, rd_start, rd_end, NULL);
+}
+
+/* Big enough for a long bootloader command line plus the tree's own strings:
+ * the FDT bound checks are worth exercising with something that does not fit. */
+static unsigned char fdt[4096];
 
 /* ---- synthetic SWEETXNU v1 payload, as tools/mkpayload.py writes one ---- */
 #define VIRT_BASE	0xfffffff007004000ULL	/* __TEXT vmaddr, as a real kernel */
@@ -168,21 +197,103 @@ static void build_payload(uint64_t phys_base, uint64_t mem_size, const char *cmd
 }
 
 /* One boot attempt: payload + FDT, then dl_main like start.S calls it. The
- * loader image (load/len) is the initrd slot: it must be outside the window. */
-static uint64_t boot(const char *cmdline, uint64_t phys_base, uint64_t mem_size,
-		     uint64_t rd_start, uint64_t rd_end)
+ * loader image (load/len) is the initrd slot: it must be outside the window.
+ * `bootargs` is what S-Boot leaves in /chosen/bootargs; NULL means "no such
+ * property" (the old behaviour, and the UNKNOWN-panel path). */
+static uint64_t boot_args(const char *cmdline, const char *bootargs,
+			  uint64_t phys_base, uint64_t mem_size,
+			  uint64_t rd_start, uint64_t rd_end)
 {
 	build_payload(phys_base, mem_size, cmdline);
-	build_fdt(fdt, rd_start, rd_end);
+	build_fdt_args(fdt, rd_start, rd_end, bootargs);
 	memset((void *)T_FB_BASE, 0x11, 0x10000);
 	memset((void *)T_RAMOOPS, 0x00, 0x10000);
 	return dl_main((uintptr_t)fdt, 1, 0x30d00800UL,
 		       (uintptr_t)T_RD, 0x40000UL);
 }
 
+static uint64_t boot(const char *cmdline, uint64_t phys_base, uint64_t mem_size,
+		     uint64_t rd_start, uint64_t rd_end)
+{
+	return boot_args(cmdline, NULL, phys_base, mem_size, rd_start, rd_end);
+}
+
 static uint64_t boot_ok(const char *cmdline)
 {
 	return boot(cmdline, T_XNU_BASE, T_XNU_WIN, T_RD, T_RD + PAYLOAD_LEN);
+}
+
+/* The same, with a bootloader command line in the DTB. */
+static uint64_t boot_ok_args(const char *cmdline, const char *bootargs)
+{
+	return boot_args(cmdline, bootargs, T_XNU_BASE, T_XNU_WIN, T_RD,
+			 T_RD + PAYLOAD_LEN);
+}
+
+/* The bootloader line, as it looks on a real S9. */
+#define BA_PX01 "console=ttyMSM0 androidboot.bootloader=G9600ZHS9FQL1 " \
+		"msm_drm.dsi_display0=ss_dsi_panel_S6E3HA8_AMB577PX01_WQHD:config0 " \
+		"androidboot.hardware=qcom"
+#define BA_MQ01 "console=ttyMSM0 androidboot.bootloader=G9600ZHS9FQL1 " \
+		"msm_drm.dsi_display0=ss_dsi_panel_S6E3HA8_AMB577MQ01_WQHD:config0 " \
+		"androidboot.hardware=qcom"
+#define BA_NONE "console=ttyMSM0 androidboot.bootloader=G9600ZHS9FQL1"
+
+/*
+ * DSI_CTRL as a bootloaders leaves it. The vendor DTS says both S9 panels are
+ * dsi_cmd_mode, so D_LINK_CMD is the likely real state and D_LINK_VIDEO the one
+ * the earlier code assumed. Each case is exercised.
+ */
+#define D_LINK_VIDEO	0x000001b3u	/* ena|vid|clk|lane0-3 */
+#define D_LINK_CMD	0x000001b5u	/* ena|cmd|clk|lane0-3 */
+#define D_LINK_OFF	0x000001b4u	/* clock on, controller disabled */
+
+/* Reset the DSI register file to a plausible live link and re-init the
+ * driver, so the next boot starts from a known state. */
+static void dsi_link(uint32_t ctrl)
+{
+	memset(starq_dsi_regs_ctrl, 0, sizeof(starq_dsi_regs_ctrl));
+	memset(starq_dsi_regs_phy, 0, sizeof(starq_dsi_regs_phy));
+	starq_dsi_regs_ctrl[0x004 / 4] = ctrl;
+	starq_dsi_regs_ctrl[0x008 / 4] = 0;		/* idle */
+	starq_dsi_regs_ctrl[0x028 / 4] = 0x0c5c0080u;	/* active_v start/end */
+	starq_dsi_regs_phy[0x0ec / 4] = 1;		/* refgen ready */
+	starq_dsi_trace_n = 0;
+}
+
+/* How many register writes hit offset `off` with value `val`. */
+static unsigned dsi_count(uint32_t off, uint32_t val)
+{
+	unsigned n = 0;
+
+	for (unsigned i = 0; i < starq_dsi_trace_n; i++)
+		if (starq_dsi_trace[i].off == off && starq_dsi_trace[i].val == val)
+			n++;
+	return n;
+}
+
+/* The loader log of the last boot, from the console ramoops zone. */
+static const char *boot_log(uint32_t *lenp)
+{
+	uint32_t len = *(volatile uint32_t *)(T_RAMOOPS + 0x40008UL);
+
+	if (lenp)
+		*lenp = len;
+	return (const char *)(T_RAMOOPS + 0x4000cUL);
+}
+
+/* Where the first occurrence is, so a test can assert ordering. */
+static const char *log_at(const char *needle)
+{
+	uint32_t len;
+	const char *t = boot_log(&len);
+
+	return memmem(t, len, needle, strlen(needle));
+}
+
+static int log_has(const char *needle)
+{
+	return log_at(needle) != NULL;
 }
 
 int main(void)
@@ -358,25 +469,73 @@ int main(void)
 		check(*(volatile uint32_t *)(0xa13c0000UL) == 0, "ftrace zone untouched");
 	}
 
+	printf("== DSI: panel probe from the bootloader cmdline\n");
+	{
+		char tok[96];
+
+		/* fdt_chosen_str is the one new reader of bootloader input: it must
+		 * reject a bad magic, a truncated totalsize and an out-of-tree
+		 * offset instead of walking off into unmapped memory. */
+		unsigned char bad[512];
+		char full[256];
+
+		build_fdt_args(bad, 0x90000000UL, 0x90100000UL, BA_PX01);
+		check(fdt_chosen_str((uintptr_t)bad, "bootargs", full, sizeof(full)) &&
+		      strcmp(full, BA_PX01) == 0, "fdt_chosen_str reads bootargs");
+		check(fdt_chosen_str((uintptr_t)bad, "nosuchprop", tok, sizeof(tok)) == 0,
+		      "a missing property is refused");
+		bad[0] ^= 0xff;
+		check(fdt_chosen_str((uintptr_t)bad, "bootargs", tok, sizeof(tok)) == 0,
+		      "a wrong FDT magic is refused");
+		build_fdt_args(bad, 0x90000000UL, 0x90100000UL, BA_PX01);
+		bad[7] = 0x10;		/* totalsize far beyond the buffer */
+		check(fdt_chosen_str((uintptr_t)bad, "bootargs", tok, sizeof(tok)) == 0,
+		      "an out-of-range totalsize is refused");
+		build_fdt_args(bad, 0x90000000UL, 0x90100000UL, BA_PX01);
+		bad[11] = 0xf0;		/* off_dt_struct past the end */
+		check(fdt_chosen_str((uintptr_t)bad, "bootargs", tok, sizeof(tok)) == 0,
+		      "an out-of-range off_dt_struct is refused");
+		build_fdt_args(bad, 0x90000000UL, 0x90100000UL, BA_PX01);
+		check(fdt_chosen_str((uintptr_t)bad, "bootargs", tok, 4) == 1 &&
+		      strcmp(tok, "con") == 0,
+		      "a short buffer truncates rather than overrunning");
+
+		check(starq_dsi_panel_from_cmdline(BA_PX01, tok, sizeof(tok)) ==
+		      STARQ_PANEL_PX01 &&
+		      strcmp(tok, "ss_dsi_panel_S6E3HA8_AMB577PX01_WQHD:config0") == 0,
+		      "PX01 bootargs -> PX01, token \"%s\"", tok);
+		check(starq_dsi_panel_from_cmdline(BA_MQ01, tok, sizeof(tok)) ==
+		      STARQ_PANEL_MQ01 &&
+		      strcmp(tok, "ss_dsi_panel_S6E3HA8_AMB577MQ01_WQHD:config0") == 0,
+		      "MQ01 bootargs -> MQ01, token \"%s\"", tok);
+		check(starq_dsi_panel_from_cmdline(BA_NONE, tok, sizeof(tok)) ==
+		      STARQ_PANEL_UNKNOWN && tok[0] == 0,
+		      "neither name -> UNKNOWN, empty token");
+		check(starq_dsi_panel_from_cmdline(NULL, tok, sizeof(tok)) ==
+		      STARQ_PANEL_UNKNOWN, "NULL bootargs -> UNKNOWN");
+		check(starq_dsi_panel_from_cmdline("", tok, sizeof(tok)) ==
+		      STARQ_PANEL_UNKNOWN, "empty bootargs -> UNKNOWN");
+		/* Only a whole token counts: the vendor property is the token's
+		 * start, so a lookalike must not match. */
+		check(starq_dsi_panel_from_cmdline(
+			      "nosomethingmsm_drm.dsi_display0=AMB577MQ01:config0", tok,
+			      sizeof(tok)) == STARQ_PANEL_UNKNOWN,
+		      "a mid-token lookalike is not the property");
+		/* The token is truncated to the buffer, not overrun. */
+		check(starq_dsi_panel_from_cmdline(BA_PX01, tok, 8) ==
+		      STARQ_PANEL_UNKNOWN && strlen(tok) == 7,
+		      "a short buffer truncates and still terminates");
+		check(starq_elvss_off("off") && !starq_elvss_off("offx") &&
+		      !starq_elvss_off("") && !starq_elvss_off(NULL) &&
+		      !starq_elvss_off("b5,8f"),
+		      "only \"off\" disables the override");
+	}
+
 	printf("== DSI DCS over the command path\n");
 	{
-		/* Register state a booting S-Boot leaves: video engine streaming,
-		 * active_v end = v_sync_width + v_back_porch + v_active = 0x0b90
-		 * (0x50 + 0x7c + 0xb90 = 0xc5c... the panel's own numbers are
-		 * 2960 + 124 + 80 = 3164 = 0xc5c). Whatever the value, the driver
-		 * must schedule the DMA on ACTIVE_V[31:16] and never invent one. */
-		memset(starq_dsi_regs_ctrl, 0, sizeof(starq_dsi_regs_ctrl));
-		memset(starq_dsi_regs_phy, 0, sizeof(starq_dsi_regs_phy));
-		starq_dsi_regs_ctrl[0x004 / 4] = 0x000001b3u; /* ena|vid|cmd|clk|lane0-3 */
-		starq_dsi_regs_ctrl[0x008 / 4] = 0x00000000u; /* idle */
-		starq_dsi_regs_ctrl[0x028 / 4] = 0x0c5c0080u; /* active_v start/end */
-		starq_dsi_regs_phy[0x0ec / 4] = 0x00000001u; /* refgen ready */
-
-		check(starq_dsi_init(T_DSI_CTRL, T_DSI_PHY) == 0, "init maps both blocks");
-		check(starq_dsi_regs_phy[0x0ec / 4] == 1, "PHY snapshot did not write it");
+		struct starq_dcs_seq s;
 
 		/* --- parsing: one command --- */
-		struct starq_dcs_seq s;
 		check(starq_dcs_parse("b5,8f,dc,0a", &s) == 0 && s.n == 1 &&
 		      s.cmd[0].len == 4 && s.cmd[0].data[0] == 0xb5 &&
 		      s.cmd[0].data[1] == 0x8f && s.cmd[0].data[2] == 0xdc &&
@@ -416,29 +575,128 @@ int main(void)
 		check(starq_dcs_parse("b5,8f;", &s) != 0 && s.n == 0,
 		      "malformed second command clears a valid first one");
 
-		/* --- no boot-arg: nothing is sent --- */
+		/* --- the default policy per panel ---
+		 * Both S9 panels are dsi_cmd_mode in the vendor DTS, but the
+		 * register decides; the default sequence is
+		 *   f0 5a 5a ; b5 8f dc <elvss> ; f0 a5 a5
+		 * with <elvss> = 0x16 on PX01 and 0x0a on MQ01. */
+		dsi_link(D_LINK_VIDEO);
 		starq_dsi_trace_n = 0;
 		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
-		entry = boot_ok("starqfb=0");
-		check(entry != 0, "booted with no starqelvss");
-		check(starq_dsi_trace_n == 0, "no DSI write without the boot-arg (%u)",
-		      starq_dsi_trace_n);
+		check(boot_ok_args("starqfb=0", BA_PX01) != 0, "booted");
+		check(dsi_count(0x090, 1) == 3, "PX01 default sends 3 commands (%u)",
+		      dsi_count(0x090, 1));
+		check(log_has("dcs f0 5a 5a") && log_has("dcs b5 8f dc 16") &&
+		      log_has("dcs f0 a5 a5"),
+		      "PX01 default sends f0 5a 5a ; b5 8f dc 16 ; f0 a5 a5");
+		/* ...and in that order, not just present: the key has to be on
+		 * before 0xB5 and off after it. */
 		{
-			/* No boot-arg means no register access at all: a read of an
-			 * unclocked MDSS block can hang the interconnect, and that
-			 * costs an Odin flash. The log says so instead. */
-			const char *t = (const char *)0xa134000cUL;
-			uint32_t len = *(volatile uint32_t *)(0xa1340008UL);
-			check(memmem(t, len, "DSI0 left alone", 15) != NULL,
-			      "no boot-arg leaves DSI0 untouched");
-			check(memmem(t, len, "STARQ DSI: ctrl=", 16) == NULL,
-			      "and does not even snapshot the registers");
-		}
+			const char *k1 = log_at("dcs f0 5a 5a");
+			const char *b5 = log_at("dcs b5 8f dc 16");
+			const char *k2 = log_at("dcs f0 a5 a5");
 
-		/* --- starqelvss= sends the sequence, in order, via DMA --- */
+			check(k1 && b5 && k2 && k1 < b5 && b5 < k2,
+			      "level-1 key on, 0xB5, level-1 key off, in that order");
+		}
+		check(log_has("panel=PX01 name=ss_dsi_panel_S6E3HA8_AMB577PX01_WQHD:config0"),
+		      "the panel name is logged");
+		/* the last packet left in the buffer is the key-off */
+		check(starq_dsi_cmd_buf[4] == 0xf0 && starq_dsi_cmd_buf[5] == 0xa5,
+		      "last packet is the level-1 key off");
+
+		dsi_link(D_LINK_VIDEO);
 		starq_dsi_trace_n = 0;
 		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
-		check(boot_ok("starqfb=0 starqelvss=b5,8f,dc,0a") != 0, "booted");
+		check(boot_ok_args("starqfb=0", BA_MQ01) != 0, "booted");
+		check(dsi_count(0x090, 1) == 3, "MQ01 default sends 3 commands (%u)",
+		      dsi_count(0x090, 1));
+		check(log_has("dcs b5 8f dc 0a") && !log_has("dcs b5 8f dc 16"),
+		      "MQ01 default sends b5 8f dc 0a");
+		check(log_has("panel=MQ01 name=ss_dsi_panel_S6E3HA8_AMB577MQ01_WQHD:config0"),
+		      "the MQ01 panel name is logged");
+
+		/* UNKNOWN: no panel token at all. The policy sends the PX01 value
+		 * and says why. */
+		dsi_link(D_LINK_VIDEO);
+		starq_dsi_trace_n = 0;
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		check(boot_ok_args("starqfb=0", BA_NONE) != 0, "booted");
+		check(dsi_count(0x090, 1) == 3 && log_has("dcs b5 8f dc 16"),
+		      "UNKNOWN panel sends the PX01 value (0x16)");
+		check(log_has("panel=UNKNOWN") &&
+		      log_has("assuming PX01") &&
+		      log_has("errs towards less green"),
+		      "the UNKNOWN choice and its reasoning are logged");
+		/* and with no bootargs property at all */
+		dsi_link(D_LINK_VIDEO);
+		starq_dsi_trace_n = 0;
+		check(boot_ok("starqfb=0") != 0, "booted");
+		check(dsi_count(0x090, 1) == 3, "no /chosen/bootargs still uses the default");
+
+		/* --- starqelvss=off: nothing sent, but the probe still runs --- */
+		dsi_link(D_LINK_CMD);	/* the register says command mode */
+		starq_dsi_trace_n = 0;
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		check(boot_ok_args("starqfb=0 starqelvss=off", BA_PX01) != 0, "booted");
+		check(dsi_count(0x090, 1) == 0, "starqelvss=off sends nothing (%u)",
+		      dsi_count(0x090, 1));
+		check(log_has("starqelvss=off, nothing sent"), "and says so");
+		check(log_has("DSI_CTRL=0x000001b5 en=1 video=0 cmd=1"),
+		      "the mode probe line prints all eight hex digits");
+		check(log_has("ack_err=0x00000000 timeout=0x00000000"),
+		      "the Ack_Err and Timeout status words are logged");
+		check(log_has("panel in COMMAND mode"), "command mode recognised");
+		check(log_has("ack_err=") && log_has("timeout="),
+		      "DSI_ACK_ERR_STATUS and DSI_TIMEOUT_STATUS are logged");
+
+		/* --- a boot-arg still overrides everything --- */
+		dsi_link(D_LINK_VIDEO);
+		starq_dsi_trace_n = 0;
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		check(boot_ok_args("starqfb=0 starqelvss=b5,19,dc,0a", BA_PX01) != 0,
+		      "booted");
+		check(dsi_count(0x090, 1) == 1 && log_has("dcs b5 19 dc 0a"),
+		      "starqelvss= replaces the default (1 command, as given)");
+		check(log_has("explicit sequence"), "and is logged as explicit");
+
+		/* --- starqmps= overrides byte 2 of the default --- */
+		dsi_link(D_LINK_VIDEO);
+		starq_dsi_trace_n = 0;
+		check(boot_ok_args("starqfb=0 starqmps=cc", BA_PX01) != 0, "booted");
+		check(log_has("dcs b5 8f cc 16"), "starqmps=cc -> b5 8f cc 16");
+		dsi_link(D_LINK_VIDEO);
+		starq_dsi_trace_n = 0;
+		check(boot_ok_args("starqfb=0 starqmps=0xcc", BA_MQ01) != 0, "booted");
+		check(log_has("dcs b5 8f cc 0a"), "starqmps=0xcc -> b5 8f cc 0a");
+		/* an invalid value does not change the default */
+		dsi_link(D_LINK_VIDEO);
+		starq_dsi_trace_n = 0;
+		check(boot_ok_args("starqfb=0 starqmps=zz", BA_PX01) != 0, "booted");
+		check(log_has("dcs b5 8f dc 16") && log_has("bad starqmps"),
+		      "a bad starqmps is logged and 0xdc kept");
+
+		/* --- DSI_CTRL.ENABLE clear: the link is down, nothing is sent --- */
+		dsi_link(D_LINK_OFF);
+		starq_dsi_trace_n = 0;
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		check(boot_ok_args("starqfb=0", BA_PX01) != 0, "boot still succeeds");
+		check(dsi_count(0x090, 1) == 0, "link down sends nothing (%u)",
+		      dsi_count(0x090, 1));
+		check(log_has("LINK DOWN (DSI_CTRL.ENABLE=0)"), "link down is logged");
+		check(log_has("link down, sequence dropped"),
+		      "the dropped sequence is logged");
+		/* the same through the single-command path */
+		check(starq_dsi_dcs_write((const uint8_t *)"b5\x8f\xdc\x16", 4) != 0 &&
+		      log_has("link down, command dropped"),
+		      "starq_dsi_dcs_write refuses too");
+
+		/* --- the packet, the DMA offsets and the schedule --- */
+		dsi_link(D_LINK_VIDEO);
+		starq_dsi_trace_n = 0;
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		check(boot_ok_args("starqfb=0 starqelvss=b5,8f,dc,16", BA_PX01) != 0,
+		      "booted");
 		{
 			unsigned mem_off = 0, trig = 0, sched = 0;
 			for (unsigned i = 0; i < starq_dsi_trace_n; i++) {
@@ -456,126 +714,104 @@ int main(void)
 			      starq_dsi_cmd_buf[2] == 0x39 &&
 			      starq_dsi_cmd_buf[3] == (0x80 | 0x40) &&
 			      starq_dsi_cmd_buf[4] == 0xb5 && starq_dsi_cmd_buf[5] == 0x8f &&
-			      starq_dsi_cmd_buf[6] == 0xdc && starq_dsi_cmd_buf[7] == 0x0a,
-			      "long-write packet: 4 0 39 c0 b5 8f dc 0a");
-			const char *t = (const char *)0xa134000cUL;
-			uint32_t len = *(volatile uint32_t *)(0xa1340008UL);
-			check(memmem(t, len, "STARQ DSI: dcs b5 8f dc 0a", 26) != NULL,
-			      "every byte logged");
-			check(memmem(t, len, "STARQ DSI: command sent", 23) != NULL,
-			      "completion logged");
-			check(memmem(t, len, "sched line=0xc5c", 16) != NULL,
+			      starq_dsi_cmd_buf[6] == 0xdc && starq_dsi_cmd_buf[7] == 0x16,
+			      "long-write packet: 4 0 39 c0 b5 8f dc 16");
+			check(log_has("STARQ DSI: command sent"), "completion logged");
+			check(log_has("sched line=0xc5c"),
 			      "DMA scheduled on the ACTIVE_V blanking line");
-			check(memmem(t, len, "mode=video", 10) != NULL,
-			      "video mode recognised from DSI_CTRL");
+			check(log_has("video=1 cmd=0"),
+			      "video mode reported from DSI_CTRL");
+			check(log_has("panel in VIDEO mode"),
+			      "and explained in words");
 		}
 
-		/* --- one byte becomes a short write --- */
+		/* --- the level-1 key is a 3-byte short write with parameter --- */
+		dsi_link(D_LINK_VIDEO);
 		starq_dsi_trace_n = 0;
-		check(boot_ok("starqelvss=29") != 0, "booted");
+		check(boot_ok_args("starqfb=0", BA_PX01) != 0, "booted");
+		check(starq_dsi_cmd_buf[0] == 3 && starq_dsi_cmd_buf[1] == 0 &&
+		      starq_dsi_cmd_buf[2] == 0x39 &&
+		      starq_dsi_cmd_buf[3] == (0x80 | 0x40),
+		      "the key-off is a long write of 3 bytes (WC=3)");
+
+		/* --- one byte becomes a short write --- */
+		dsi_link(D_LINK_VIDEO);
+		starq_dsi_trace_n = 0;
+		check(boot_ok_args("starqelvss=29", BA_PX01) != 0, "booted");
 		check(starq_dsi_cmd_buf[0] == 0x29 && starq_dsi_cmd_buf[1] == 0 &&
 		      starq_dsi_cmd_buf[2] == 0x05 && starq_dsi_cmd_buf[3] == 0x80,
 		      "1-byte DCS write -> short write packet 29 00 05 80");
 
 		/* --- two commands, both sent, in order --- */
+		dsi_link(D_LINK_VIDEO);
 		starq_dsi_trace_n = 0;
-		check(boot_ok("starqelvss=f0,5a,5a;b5,8f,dc,0a") != 0, "booted");
-		{
-			unsigned trig = 0;
-			for (unsigned i = 0; i < starq_dsi_trace_n; i++)
-				if (starq_dsi_trace[i].off == 0x090 && starq_dsi_trace[i].val == 1)
-					trig++;
-			check(trig == 2, "two triggers for two commands (%u)", trig);
-			/* the second command's packet is what remains in the buffer */
-			check(starq_dsi_cmd_buf[4] == 0xb5, "second packet is b5 ...");
-		}
+		check(boot_ok_args("starqelvss=f0,5a,5a;b5,8f,dc,16", BA_PX01) != 0,
+		      "booted");
+		check(dsi_count(0x090, 1) == 2, "two triggers for two commands (%u)",
+		      dsi_count(0x090, 1));
+		check(starq_dsi_cmd_buf[4] == 0xb5, "second packet is b5 ...");
 
 		/* --- malformed: rejected, and nothing reaches the wire --- */
+		dsi_link(D_LINK_VIDEO);
 		starq_dsi_trace_n = 0;
 		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
-		check(boot_ok("starqelvss=b5,zz") != 0, "boot still succeeds");
-		{
-			unsigned trig = 0;
-			for (unsigned i = 0; i < starq_dsi_trace_n; i++)
-				if (starq_dsi_trace[i].off == 0x090)
-					trig++;
-			check(trig == 0, "malformed list sends nothing (%u triggers)", trig);
-			const char *t = (const char *)0xa134000cUL;
-			uint32_t len = *(volatile uint32_t *)(0xa1340008UL);
-			check(memmem(t, len, "nothing sent", 12) != NULL,
-			      "malformed list is logged, not silently dropped");
-		}
+		check(boot_ok_args("starqelvss=b5,zz", BA_PX01) != 0, "boot still succeeds");
+		check(dsi_count(0x090, 1) == 0, "malformed list sends nothing (%u)",
+		      dsi_count(0x090, 1));
+		check(log_has("nothing sent"),
+		      "malformed list is logged, not silently dropped");
 
 		/* --- the memory path times out: FIFO fallback carries it --- */
+		dsi_link(D_LINK_VIDEO);
 		starq_dsi_sim_stall = 1;	/* memory path never completes */
 		starq_dsi_trace_n = 0;
 		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
-		check(boot_ok("starqelvss=b5,8f,dc,0a") != 0, "booted");
+		check(boot_ok_args("starqelvss=b5,8f,dc,16", BA_PX01) != 0, "booted");
 		starq_dsi_sim_stall = 0;
-		{
-			unsigned fifo = 0;
-			for (unsigned i = 0; i < starq_dsi_trace_n; i++)
-				if (starq_dsi_trace[i].off == 0x15c &&
-				    starq_dsi_trace[i].val == ((1u << 1) | (1u << 2) | (3u << 16)))
-					fifo = 1;
-			check(fifo, "FIFO path used after the memory timeout");
-			const char *t = (const char *)0xa134000cUL;
-			uint32_t len = *(volatile uint32_t *)(0xa1340008UL);
-			check(memmem(t, len, "DMA done timeout", 16) != NULL,
-			      "timeout logged, not a hang");
-			check(memmem(t, len, "FIFO fallback", 13) != NULL,
-			      "fallback logged");
-			check(memmem(t, len, "STARQ DSI: command sent", 23) != NULL,
-			      "command still delivered");
-		}
+		check(dsi_count(0x15c, (1u << 1) | (1u << 2) | (3u << 16)) > 0,
+		      "FIFO path used after the memory timeout");
+		check(log_has("DMA done timeout"), "timeout logged, not a hang");
+		check(log_has("FIFO fallback"), "fallback logged");
+		check(log_has("STARQ DSI: command sent"), "command still delivered");
 
 		/* --- both paths stall: an error, never a hang --- */
+		dsi_link(D_LINK_VIDEO);
 		starq_dsi_sim_stall = 3;
 		starq_dsi_trace_n = 0;
 		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
-		check(boot_ok("starqelvss=b5,8f,dc,0a") != 0, "booted");
+		check(boot_ok_args("starqelvss=b5,8f,dc,16", BA_PX01) != 0, "booted");
 		starq_dsi_sim_stall = 0;
-		{
-			const char *t = (const char *)0xa134000cUL;
-			uint32_t len = *(volatile uint32_t *)(0xa1340008UL);
-			check(memmem(t, len, "command FAILED", 14) != NULL,
-			      "both paths timing out is an error");
-			check(memmem(t, len, "override not applied", 20) != NULL,
-			      "loader reports the override did not take");
-			/* and XNU is still started: the panel is not worth a hang */
-			check(memmem(t, len, "JUMP TO XNU", 11) != NULL,
-			      "boot continues after a failed DCS write");
-		}
+		check(log_has("command FAILED"), "both paths timing out is an error");
+		check(log_has("override not applied"),
+		      "loader reports the override did not take");
+		/* and XNU is still started: the panel is not worth a hang */
+		check(log_has("JUMP TO XNU"), "boot continues after a failed DCS write");
 
 		/* --- nothing outside the command path is written --- */
 		{
 			/* Video timing, PHY and clock registers, as a fresh boot
 			 * leaves them; a transfer must leave every one alone. */
-			static const uint32_t ro_ctrl[] = { 0x008, 0x00c, 0x010, 0x014,
-				0x018, 0x01c, 0x024, 0x028, 0x02c, 0x030, 0x034,
-				0x038, 0x084, 0x0a8, 0x0ac, 0x0b0, 0x11c, 0x120 };
+			static const uint32_t ro_ctrl[] = { 0x000, 0x004, 0x008, 0x00c,
+				0x010, 0x014, 0x018, 0x01c, 0x024, 0x028, 0x02c,
+				0x030, 0x034, 0x038, 0x084, 0x0a8, 0x0ac, 0x0b0,
+				0x0c0, 0x11c, 0x120 };
 			static const uint32_t ro_phy[] = { 0x010, 0x014, 0x018, 0x01c,
 				0x020, 0x024, 0x030, 0x038, 0x0ac, 0x0b0, 0x0ec,
 				0x0f4, 0x0f8 };
 			uint32_t snap_ctrl[sizeof(ro_ctrl) / 4], snap_phy[sizeof(ro_phy) / 4];
 			unsigned before = 0, bad = 0;
 
-			memset(starq_dsi_regs_ctrl, 0xa5, sizeof(starq_dsi_regs_ctrl));
-			memset(starq_dsi_regs_phy, 0x5a, sizeof(starq_dsi_regs_phy));
-			/* a plausible live link */
-			starq_dsi_regs_ctrl[0x004 / 4] = 0x000001b3u;
-			starq_dsi_regs_ctrl[0x008 / 4] = 0x00000000u; /* idle */
-			starq_dsi_regs_ctrl[0x028 / 4] = 0x0c5c0080u;
-			starq_dsi_regs_ctrl[0x110 / 4] = 0x02000000u; /* error mask bit */
-			starq_dsi_regs_phy[0x0ec / 4] = 1;
+			dsi_link(D_LINK_VIDEO);
 			for (unsigned i = 0; i < sizeof(ro_ctrl) / 4; i++)
 				snap_ctrl[i] = starq_dsi_regs_ctrl[ro_ctrl[i] / 4];
 			for (unsigned i = 0; i < sizeof(ro_phy) / 4; i++)
 				snap_phy[i] = starq_dsi_regs_phy[ro_phy[i] / 4];
 
 			before = starq_dsi_trace_n;
-			check(starq_dsi_dcs_write((const uint8_t *)"b5\x8f\xdc\x0a", 4) == 0,
-			      "write succeeds against the live-link register file");
+			check(starq_dsi_init(T_DSI_CTRL, T_DSI_PHY) == 0 &&
+			      starq_dsi_elvss("", STARQ_PANEL_PX01,
+					      STARQ_ELVSS_MPS) == 3,
+			      "default sequence sent against the live-link register file");
 			for (unsigned i = 0; i < sizeof(ro_ctrl) / 4; i++)
 				if (starq_dsi_regs_ctrl[ro_ctrl[i] / 4] != snap_ctrl[i]) {
 					bad++;
@@ -588,31 +824,32 @@ int main(void)
 					printf("      phy %#x: %#x -> %#x\n", ro_phy[i],
 					       snap_phy[i], starq_dsi_regs_phy[ro_phy[i] / 4]);
 				}
-			check(bad == 0, "no video-timing, PHY or clock register written");
+			check(bad == 0, "no video-timing, PHY, clock or DSI_CTRL write");
 			check(starq_dsi_trace_n > before, "the transfer did write something");
 		}
 
 		/* --- starqdsisw=1: no schedule, plain software trigger --- */
+		dsi_link(D_LINK_VIDEO);
 		starq_dsi_trace_n = 0;
-		check(boot_ok("starqdsisw=1 starqelvss=b5,8f,dc,0a") != 0, "booted");
-		{
-			unsigned sched = 0;
-			for (unsigned i = 0; i < starq_dsi_trace_n; i++)
-				if (starq_dsi_trace[i].off == 0x100)
-					sched++;
-			check(sched == 0, "starqdsisw=1 leaves DSI_DMA_SCHEDULE_CTRL alone");
-		}
+		check(boot_ok_args("starqdsisw=1 starqelvss=b5,8f,dc,16", BA_PX01) != 0,
+		      "booted");
+		check(dsi_count(0x100, 0) == 0, "starqdsisw=1 leaves DMA_SCHED alone");
+
+		/* --- a command-mode link never programs the schedule --- */
+		dsi_link(D_LINK_CMD);
+		starq_dsi_trace_n = 0;
+		check(boot_ok_args("starqfb=0", BA_PX01) != 0, "booted");
+		check(dsi_count(0x100, 0) == 0 && dsi_count(0x090, 1) == 3,
+		      "command mode: 3 commands, no DMA schedule");
 
 		/* --- a lookalike boot-arg must not match --- */
+		dsi_link(D_LINK_VIDEO);
 		starq_dsi_trace_n = 0;
-		check(boot_ok("nostarqelvss=b5,8f,dc,0a") != 0, "booted");
-		{
-			unsigned trig = 0;
-			for (unsigned i = 0; i < starq_dsi_trace_n; i++)
-				if (starq_dsi_trace[i].off == 0x090)
-					trig++;
-			check(trig == 0, "nostarqelvss= sends nothing");
-		}
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		check(boot_ok_args("nostarqelvss=b5,8f,dc,0a", BA_MQ01) != 0, "booted");
+		check(log_has("dcs b5 8f dc 0a") && !log_has("dcs b5 8f dc 0a pkt"),
+		      "nostarqelvss= is ignored, the MQ01 default runs");
+		check(dsi_count(0x090, 1) == 3, "and the default policy still applies");
 	}
 
 	printf(failures ? "\n%d FAILURE(S)\n" : "\nall checks passed\n", failures);
