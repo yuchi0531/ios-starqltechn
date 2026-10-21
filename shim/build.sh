@@ -1,7 +1,9 @@
 #!/bin/bash
 # Build the shim and wrap it in a boot image.
-#   BOARD=sweet (default)  -> boot.img v2 with the stock Xiaomi header
-#   BOARD=starqltechn      -> Samsung S9 SM-G9600 boot.img v0 that reuses the
+#   BOARD=sweet (default)  -> boot.img v2 with the stock Xiaomi header, the
+#                             Qualcomm ABL shim (shim.c)
+#   BOARD=starqltechn      -> shim/starqltechn/build.sh: the Samsung S-Boot
+#                             loader, packed into a boot.img v0 that reuses the
 #                             stock Samsung header and DTBH dt section
 # FB_* defaults are sweet's; a board overrides them through CFLAGS.
 #
@@ -26,10 +28,9 @@ BOARD_CFLAGS=""
 case "$BOARD" in
 sweet) IMG=${IMG:-out/shim-boot.img} ;;
 starqltechn)
-	# Splash framebuffer from the mainline dts: chosen/framebuffer with
-	# reserved-memory framebuffer_mem: memory@9d400000, 1440x2960 a8r8g8b8.
-	BOARD_CFLAGS="-DFB_BASE=0x9d400000 -DFB_W=1440 -DFB_H=2960"
-	# Samsung boot.img v0: no mkbootimg, the packer reuses the stock header.
+	# The framebuffer (0x9d400000, 1440x2960 a8r8g8b8), the RAM window and
+	# the ramoops addresses are loader.c's own #ifndef-guarded defaults; no
+	# -D is needed here. OUT.img defaults to a separate name.
 	IMG=${IMG:-out/shim-boot-starqltechn.img}
 	;;
 *)
@@ -37,6 +38,37 @@ starqltechn)
 	exit 1
 	;;
 esac
+
+# starqltechn does not use the Qualcomm ABL shim at all: S-Boot behaves like a
+# Linux bootloader (EL1, MMU off, x0 = DTB, initrd through /chosen) and the
+# image is a Samsung boot.img v0, so shim/starqltechn/ has its own entry, link
+# script, loader and build. Everything below this block is the sweet path.
+if [ "$BOARD" = starqltechn ]; then
+	mkdir -p out
+	# CFLAGS_EXTRA passes straight through (e.g. -DSTARQ_FB_TEST=0).
+	if [ "$PACK" = 0 ]; then
+		OUT_DIR=out bash starqltechn/build.sh
+	elif [ $# -ge 3 ]; then
+		# STOCK_BOOT.img PAYLOAD.bin OUT.img [DTBH.bin]
+		OUT_DIR=out bash starqltechn/build.sh "$@"
+	elif [ -z "$STOCK_BOOT" ] || [ -z "${1:-}" ]; then
+		# Samsung header v0 with a Qualcomm DTBH dt section. There is no
+		# mkbootimg layout for it that matches the phone: use the stock image
+		# as the template, and a payload to put in it.
+		echo "error: BOARD=starqltechn packing needs STOCK_BOOT=STOCK.img" >&2
+		echo "       and the payload as \$1 (or: shim/build.sh STOCK PAYLOAD OUT)" >&2
+		echo "       (stock boot image: backup/starq/boot.img; tools/starq-boot.sh" >&2
+		echo "        passes both, tools/starq-flash.sh backup pulls the image)" >&2
+		exit 1
+	elif [ -n "${DTB_FILE:-}" ]; then
+		OUT_DIR=out bash starqltechn/build.sh \
+			"$STOCK_BOOT" "$1" "$IMG" "$DTB_FILE"
+	else
+		OUT_DIR=out bash starqltechn/build.sh "$STOCK_BOOT" "$1" "$IMG"
+	fi
+	exit 0
+fi
+
 mkdir -p out
 for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c; do
 	$CC $CFLAGS $BOARD_CFLAGS -c $f -o out/${f%.*}.o
@@ -62,28 +94,12 @@ if [ "$PACK" = 0 ]; then
 	# Compile only; the caller packs (tools/starq-boot.sh runs starq_mkboot.py
 	# itself, which is what lets OUT.img be an arbitrary path).
 	echo "PACK=0: compiled out/Image and out/ramdisk.bin, no boot image written" >&2
-elif [ "$BOARD" = sweet ]; then
+else
 	mkbootimg --header_version 2 --kernel out/Image --ramdisk out/ramdisk.bin \
 		--dtb "$DTB" --base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
 		--tags_offset 0x100 --dtb_offset 0x1f00000 --pagesize 4096 \
 		--os_version 17.0.0 --os_patch_level 2035-06 \
 		--cmdline "console=null" -o out/shim-boot.img
-elif [ -z "$STOCK_BOOT" ]; then
-	# Samsung header v0 with a Qualcomm DTBH dt section. There is no mkbootimg
-	# layout for it that matches the phone: use the stock image as the template.
-	echo "error: BOARD=starqltechn needs STOCK_BOOT=STOCK_BOOT.img" >&2
-	echo "       (the phone's own boot image, e.g. backup/starq/boot.img;" >&2
-	echo "        tools/starq-boot.sh passes it and tools/starq-flash.sh backup pulls it)" >&2
-	exit 1
-else
-	# DTB_FILE: a whole DTBH table to carry instead of the stock one.
-	if [ -n "${DTB_FILE:-}" ]; then
-		python3 ../tools/starq_mkboot.py "$STOCK_BOOT" out/Image \
-			out/ramdisk.bin "$IMG" --dtb "$DTB_FILE"
-	else
-		python3 ../tools/starq_mkboot.py "$STOCK_BOOT" out/Image \
-			out/ramdisk.bin "$IMG"
-	fi
 fi
 # Host render of the console layout.
 gcc -O1 -Wall $BOARD_CFLAGS -o out/host_test console.c host_test.c && ./out/host_test
