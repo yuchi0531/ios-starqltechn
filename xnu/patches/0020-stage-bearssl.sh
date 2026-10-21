@@ -1,7 +1,8 @@
 #!/bin/bash
 # Pinned, portable constant-time AES for the SWEET legacy CBC/ECB API.
 set -euo pipefail
-[[ "${MACHINE_CONFIG:-}" == SWEET ]] || exit 0
+# Both Qualcomm boards compile libkern/crypto/sweet_* (0082 defines -DSWEET).
+case "${MACHINE_CONFIG:-}" in SWEET|STARQLTECHN) ;; *) exit 0 ;; esac
 [[ -f libkern/crypto/corecrypto_aes.c ]] || exit 1
 bearssl_sha=7bea48e5e850ab4cafbe68d3765cdaba13a86d6f
 bearssl_tmp=$(mktemp -d)
@@ -42,4 +43,4 @@ for name in ('hash/md5.c', 'codec/dec32le.c', 'codec/enc32le.c',
     shutil.copy2(source / 'src' / name, target / 'src' / name)
 shutil.copy2(source / 'LICENSE.txt', target / 'LICENSE.txt')
 PY
-echo "Staged BearSSL portable AES, MD5, SHA-1 and SHA-384/512 ($bearssl_sha) for SWEET"
+echo "Staged BearSSL portable AES, MD5, SHA-1 and SHA-384/512 ($bearssl_sha) for SWEET/STARQLTECHN"
