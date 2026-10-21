@@ -1,9 +1,26 @@
 # iOS on the Galaxy S9 Snapdragon (`starqltechn`, SM-G9600 / SC-02K)
 
 End-to-end procedure for the Samsung Galaxy S9 with the Qualcomm SDM845 — the
-`starqltechn` board in `tools/mkadt.py`. Everything here is untested on
-hardware as of 2026-10-21: the pipeline builds and round-trips an image, the
-phone side is written but has not been run.
+`starqltechn` board in `tools/mkadt.py`. Nothing here has run on hardware as of
+2026-10-21: the kernel builds in CI (run 39590143218, `xnu-kernel` artifact,
+17,172,536-byte `kernel.development.starqltechn`) and the whole chain from Mach-O
+to a Samsung `boot.img` runs on a Linux host against a synthetic stock image
+(46,816-byte loader Image, 16,658,432-byte `starq-ios-boot.img` with the stock
+header and a recomputed kernel SHA-1), but the phone side is written and unrun.
+Everything that needs the phone is in "What is still open".
+
+## Reference ports
+
+| Port | SoC | What it gave this port |
+| --- | --- | --- |
+| `https://github.com/Floppikrob/ios-galaxy-s8` | Exynos 8895 Galaxy S8, reaches the iOS lock screen | the Samsung `boot.img` packing scheme, the BOOT-partition/TWRP workflow (no fastboot), the S6SY761 touch protocol (same IC as the S9), the ramoops logging scheme and the XNU-RAM-zeroing lesson |
+| `MakrSas/ios-topaz` | sibling port | not used here |
+| `orhunnx/ios-a5xelte` | sibling port | not used here |
+
+The S8 is the closest Samsung reference, but it is Exynos: it says nothing about
+the SDM845 side (memory map, RPMh, UFS, GENI, PMIC). Those addresses come from
+mainline's `sdm845-samsung-starqltechn.dts` and have to be confirmed against the
+live FDT (see "What is still open").
 
 ## Read this first: there is no fastboot
 
@@ -54,14 +71,38 @@ broken boot partition.
 ## 1. Build the kernel
 
 Same CI as the main README (`xnu/patches/`, `gh workflow run xnu.yml`, with
-`machine_config` for this board). The result is a `kernel.development.*`
-Mach-O, which step 2 consumes. The patches for this board are not part of this
-directory.
+`machine_config=STARQLTECHN` for this board). The result is a
+`kernel.development.starqltechn` Mach-O, which step 2 consumes.
+
+```sh
+gh workflow run xnu.yml -f machine_config=STARQLTECHN
+gh run download RUN_ID -n xnu-kernel -D xnu/out-starqltechn
+```
+
+The patches for this board are not part of this directory (they are
+`xnu/patches/0082-starqltechn-board.patch`). The workflow's `concurrency` group is
+`xnu-${{ github.ref }}` with `cancel-in-progress: true`, so **run one machine
+config at a time**: a second dispatch within seconds silently cancels the first.
+
+| Run | `machine_config` | Result |
+| --- | --- | --- |
+| 39590143218 | STARQLTECHN | success, 17,172,536-byte `kernel.development.starqltechn` |
+| 39591208114 | SWEET | success (the sweet port still builds) |
 
 ## 2. Build the boot image
 
-Needs `aarch64-linux-gnu-gcc` (+ binutils) and `python3`. **No `mkbootimg`** —
-`tools/starq_mkboot.py` packs the image from the stock header instead.
+Host prerequisites: `python3` and the aarch64 cross toolchain; `mkbootimg` too if
+this host also builds the `sweet` board (the Samsung path packs the image itself,
+but `shim/build.sh`'s default board still calls `mkbootimg`). On Debian/Ubuntu:
+
+```sh
+sudo apt install gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu mkbootimg
+```
+
+`tools/starq-boot.sh` checks for `python3`, `aarch64-linux-gnu-gcc`,
+`-objcopy`, `-readelf` and `-nm` before doing any work, and prints that first apt
+line if one is missing (it used to surface as a "command not found" halfway
+through the shim build).
 
 ```sh
 tools/starq-boot.sh xnu/out/kernel.development.starqltechn \
@@ -83,11 +124,46 @@ shim: see "The loader" below.
 The default boot-args keep the console **on** (`sweetfb_noconsole=0`): with no
 serial port, text on the panel is the only early output.
 
+### The ADT needs the iPhone X device tree
+
+`mkadt.py` copies `/product` from the real D22AP tree, which is what MobileGestalt
+reads to answer iPhone10,3 instead of an iPod. Without it the ADT is a valid but
+anonymous tree:
+
+| `research/ipsw-x/d22ap.adt` | ADT size | `/product` |
+| --- | --- | --- |
+| present | 12,588 bytes | yes |
+| missing | 9,904 bytes + `warning: ... missing, no /product node` | no |
+
+The extraction that works, straight from the IPSW with no full download (16.7.16 /
+20H392, `DeviceTree.d22ap.im4p` is not encrypted so no KBAG to key):
+
+```sh
+python3 tools/remotezip.py IPSW_URL Firmware/all_flash/DeviceTree.d22ap.im4p research/ipsw-x
+# DER-parse the IM4P, take the bvx2 (LZFSE) payload, decode it
+python3 tools/adt.py unwrap research/ipsw-x/Firmware/all_flash/DeviceTree.d22ap.im4p \
+    research/ipsw-x/d22ap.adt
+```
+
+`adt.py unwrap` does both steps: it walks the IM4P as a DER sequence and pipes a
+`bvx2` payload through `lzfse -decode`, so build `lzfse` first (`cmake` in
+apple/lzfse, then put the binary in `PATH`). The result is 186,084 bytes and stays
+out of git — it is an Apple artifact.
+
 Inspect an image without a phone:
 
 ```sh
 python3 tools/starq_mkboot.py --info starq-boot.img
 ```
+
+Measured artifacts on a Linux host (real kernel from CI, synthetic stock image):
+
+| Artifact | Size |
+| --- | --- |
+| `kernel.development.starqltechn` (CI run 39590143218) | 17,172,536 bytes |
+| payload (`mkpayload.py`) | 16,596,320 bytes |
+| `shim/out/Image` (loader, arm64 Linux header, magic `ARMd` at `0x38`) | 46,816 bytes |
+| `starq-ios-boot.img` | 16,658,432 bytes |
 
 The loader can be built and packed on its own, without the kernel pipeline:
 
@@ -106,7 +182,8 @@ window), builds a synthetic `SWEETXNU` payload and a real flattened device
 tree, and calls the loader's entry point exactly as `start.S` does. It covers
 the validation failures, the RAM zeroing, the segment copies, the
 `boot_args`/`deviceTreeP` fields, the framebuffer pattern and both ramoops
-zones. It is the only part of this port that has been executed.
+zones. Together with the cross build and the pack command above, that is the
+whole of what has been executed for this port.
 
 ## 3. Flash the boot image
 
@@ -120,10 +197,22 @@ The script prints the node it resolved (`/dev/block/by-name/boot` ->
 and reads the magic back. Never hardcode `sdaN`: the script resolves it every
 time, and `boot-name` prints the whole list.
 
-## 4. Boot and read the log
+## 4. First boot: read the framebuffer test pattern first
 
-After the reboot the screen shows the shim's lines, then the kernel's. To get
-the log after a crash or a hang:
+The loader paints the pattern before it validates the payload, so what the panel
+shows in the first second is the answer to the one question that decides the rest
+of the display work. Stand at the phone, do not film — the pattern is static:
+
+1. Flash, `adb reboot`, watch the panel. Four 64-line bands (white, red, green,
+   blue) at the top, then the loader's console text, then a magenta block with a
+   cyan square.
+2. **Bands and block visible** -> S-Boot left MDSS scanning out of `0x9d400000`.
+   Record it and stop worrying about display: the sweet CPU-copy path transfers.
+3. **Samsung logo, black or garbage** -> command-mode panel with its own GRAM.
+   Nothing the loader writes reaches it; MDSS/DSI has to be programmed before any
+   of the iOS display work can be reused. Note whether the cyan square is sheared
+   (wrong stride) or absent (nothing scanning out) — different failures.
+4. Only after that, read the log. To get it after a crash or a hang:
 
 ```sh
 # TWRP again (Vol Up + Bixby + Power, after Power + Vol Down to leave the hang)
@@ -158,14 +247,24 @@ Odin. If `userdata` was overwritten with the iOS root, format it in TWRP.
   the display work: if the bootloader leaves the display scanning out of that
   buffer, our CPU-copy path works exactly as on sweet; if the panel is in
   command mode with its own GRAM, nothing written there reaches it and MDSS/DSI
-  has to be programmed. The loader paints a test pattern to answer this - see
-  "The framebuffer test pattern" below.
-- `shim/starqltechn/loader.c` has never run on hardware, and nothing in this
-  tree has been cross-compiled on the machine that wrote it (no
-  `aarch64-linux-gnu-gcc` there). What *was* run is
+  has to be programmed. The loader paints a test pattern to answer this - it is
+  step 1 of the first boot (step 4 above) and is described in "The framebuffer
+  test pattern" below.
+- The `by-name` node names are unconfirmed. `tools/starq-flash.sh` resolves
+  `/dev/block/by-name/<part>`, then `bootdevice/by-name`, then
+  `platform/soc/*/by-name`, and never hardcodes `sdaN`, but the names
+  themselves (`boot`? `BOOT`? `efs`? `persist`?) have not been read off this
+  phone. `boot-name` prints the authoritative list.
+- `shim/starqltechn/loader.c` has never run on hardware. What *was* run is
   `make -C shim/starqltechn` (step 2 above): the same loader.c compiled as host
   C with the board addresses `mmap`ed, driving its validation, copy and logging
-  paths. That proves the logic, not the hardware facts.
+  paths. The cross build does now succeed on the dev host (`gcc-aarch64-linux-gnu`
+  from apt, 46,816-byte Image), but a successful link only proves the code
+  compiles and fits; every MMIO address in it is still unproven.
+- The stock `boot.img` used for packing so far is a **synthetic but realistic**
+  stub (20 MiB kernel slot, page 4096). The real one may reserve a different
+  kernel size, `os_version`, board name or DTBH table — pull it
+  (`tools/starq-flash.sh backup`) and repack before the first flash.
 
 ## The loader: `shim/starqltechn/`
 
