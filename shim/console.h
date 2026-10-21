@@ -1,10 +1,20 @@
 #pragma once
 #include <stdint.h>
 
+/* Board framebuffer. The defaults are sweet (Redmi Note 10 Pro, SM7150): the
+ * splash buffer ABL leaves on; build.sh overrides them per board. */
+#ifndef FB_BASE
 #define FB_BASE		0x9c000000UL	/* reserved-memory cont_splash_region */
+#endif
+#ifndef FB_W
 #define FB_W		1080
+#endif
+#ifndef FB_H
 #define FB_H		2400
+#endif
+#ifndef FB_STRIDE
 #define FB_STRIDE	(FB_W * 4)	/* a8r8g8b8, matches mainline simplefb */
+#endif
 
 #define RED	0xffff0000U
 #define BLUE	0xff0000a0U

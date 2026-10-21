@@ -1,7 +1,13 @@
 #pragma once
 #include <stdint.h>
+#include "console.h"	/* FB_BASE: the ADT framebuffer the shim draws into */
 
-#define FB_PHYS	0x9c000000UL
+/* The framebuffer's 32MB block is mapped Normal non-cacheable (write-combining)
+ * rather than Device, so stores can merge. Defaults to the console's FB_BASE;
+ * build.sh only needs to set FB_BASE per board. */
+#ifndef FB_PHYS
+#define FB_PHYS	FB_BASE
+#endif
 
 struct mmu_info {
 	uint64_t img_lo, img_hi, ttbr;
