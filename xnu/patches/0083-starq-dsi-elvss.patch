@@ -1,6 +1,14 @@
 --- a/bsd/dev/starqltechn_hw.c
 +++ b/bsd/dev/starqltechn_hw.c
-@@ -39,6 +39,7 @@ extern kern_return_t thread_terminate(thread_t);
+@@ -31,6 +31,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>	/* /chosen/bootargs: the panel name */
+ #include <pexpert/arm64/board_config.h>	/* SWEET_PANEL_WIDTH/HEIGHT */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -39,6 +40,7 @@
  extern void sweet_hid_touch(int finger, int down, int x, int y);
  
  void starqltechn_hw_init(void);
@@ -8,32 +16,56 @@
  int starqltechn_battery_read(unsigned *percent, unsigned *mv, int *ma,
      int *external, int *charging, int *full);
  
-@@ -1076,6 +1077,242 @@ starqltechn_battery_read(unsigned *percent, unsigned *mv, int *ma,
- 	return 0;
+@@ -1073,6 +1075,381 @@
  }
  
-+/* ------------------------------------------------------------------ */
+ /* ------------------------------------------------------------------ */
 +/* Panel ELVSS override over DSI0: the 0xB5 DCS command                */
 +/* ------------------------------------------------------------------ */
 +/*
-+ * Android fixes this panel's green tint with a Magisk module that puts
-+ * ELVSS temperature compensation on the extreme-cold table:
-+ *   samsung,elvss_tx_cmds_revA = [29 01 00 00 00 00 04 b5 19 dc 0a ...]
-+ *   (ss_dsi_panel_S6E3HA8_AMB577PX01_WQHD, sdm845-sec-starqlte DTSI)
-+ * i.e. one DSI long write of 4 bytes: DCS 0xB5, TSET, MPS, ELVSS offset. The
-+ * payload depends on the panel and may need the level-1 key unlock (F0 5A 5A)
-+ * first, so it comes from the boot-arg (starqelvss=b5,8f,dc,0a, commands
-+ * separated by ';'); nothing is sent without it, because a wrong 0xB5 leaves
-+ * the panel with a bad black level until the next reboot.
++ * The green tint on these panels is an ELVSS (black-level) calibration
++ * problem. Android fixes it with a Magisk module that forces the panel's
++ * ELVSS temperature compensation onto the extreme-cold row: TSET 0x8F, which
++ * is BIT(7) | 15, i.e. -15 C. This file does the same write from the kernel.
 + *
-+ * shim/starqltechn/dsi.c sends the same bytes from the loader; this copy
-+ * exists because XNU needs minutes to reach the GUI and the panel can be
-+ * power-cycled in between. Only the FIFO path is used
++ * Why a 4-byte DCS 0xB5 write, and nothing bigger:
++ *
++ *   - 0xB5 is NOT readable as a page. Both S9 panels expose only a 2-byte read
++ *     at a 0xB0-selected offset (samsung,elvss_rx_cmds_revA =
++ *     [06 01 00 00 00 00 01 B5 02 16], rx_len=2, read_startoffset 0x16 on PX01
++ *     / 0x17 on MQ01), so there is no read-modify-write here and no DCS read
++ *     at all: paginated reads would need three passes plus BTA handling.
++ *   - AMB577MQ01 writes 0xB5 natively as 4 bytes (b5 19 dc 0a, 26 entries,
++ *     dtsi_mq01.dtsi:2648-2676). AMB577PX01 uses a 24-byte form, but its driver
++ *     only ever changes bytes 1, 2, 3 and 23 (p_px01.c:863-889), where byte 23
++ *     is a per-panel OTP black-level trim that must be preserved, not
++ *     synthesised: sending 0x00 there throws the trim away. A 4-byte write
++ *     leaves PX01's bytes 4..23 untouched, which is the point.
++ *   - 0xB5 sits in the level-1 protected bank: PX01's own gray-spot test wraps
++ *     it in F0 5A 5A / F0 A5 A5 (dtsi_px01.dtsi:1905-1919) and ss_elvss() sets
++ *     *level_key = LEVEL1_KEY, so the write is bracketed by the key.
++ *
++ * The sequence is therefore
++ *   f0 5a 5a                  level-1 key on
++ *   b5 8f dc <elvss>          TSET 0x8f (-15 C), MPS 0xdc, ELVSS offset
++ *   f0 a5 a5                  level-1 key off
++ * with <elvss> = 0x16 on AMB577PX01 and 0x0a on AMB577MQ01 (each DT's index-0
++ * entry). MPS is 0xdc while candela_level > 39, 0xcc below.
++ *
++ * The panel identity comes from the bootloader's own command line in the
++ * device tree, /chosen/bootargs: msm_drm.dsi_display0=<panel node>:config0
++ * (dsi_display.c:7061-7064 matches panel->name). PE_parse_boot_argn cannot see
++ * it; it is a DT property, read below with SecureDTLookupEntry/GetProperty,
++ * the same way 0003/0028 read /chosen and /sweet-ufs.
++ *
++ * starqelvss=<hex list> overrides the whole sequence, starqelvss=off disables
++ * it, starqdsi=0 disables this function. Only the FIFO path is used
 + * (dsi_ctrl_hw_cmn_kickoff_fifo_command): the memory path needs a buffer the
 + * DSI DMA can read, i.e. one from the MDSS SMMU domain that no driver here
-+ * owns. Offsets: techpack dsi_ctrl_reg.h, which is mainline dsi.xml.h + 4.
-+ * No PHY, PLL, video-timing or clock register is written (DSI_CTRL is read
-+ * only) and the command path is restored after use.
++ * owns, while the command test-pattern FIFO needs no memory access at all.
++ * Offsets: techpack dsi_ctrl_reg.h, which is mainline dsi.xml.h + 4. No PHY,
++ * PLL, video-timing or clock register is written; DSI_CTRL is read only, and
++ * the command path is restored after use.
 + */
 +#define DSI0_PA   0x0ae94000u
 +#define R_CTRL    0x004		/* DSI_CTRL */
@@ -50,6 +82,20 @@
 +#define MAXCMDS   8u
 +#define MAXBYTES  64u
 +#define DPOLL     40000u	/* delay(1) per round: > one 16 ms frame */
++
++/* The ELVSS default policy, shared names with shim/starqltechn/dsi.h. */
++#define ELVSS_PANEL_UNKNOWN 0
++#define ELVSS_PANEL_PX01    1
++#define ELVSS_PANEL_MQ01    2
++#define ELVSS_TSET          0x8fu	/* BIT(7) | 15 = -15 C */
++#define ELVSS_MPS           0xdc	/* candela_level > 39 */
++#define ELVSS_PX01          0x16
++#define ELVSS_MQ01          0x0a
++/* Unknown panel: the PX01 value. PX01 is the higher-volume starqlte panel and
++ * 0x16 is the larger (more compensated) of the two, so a wrong guess errs
++ * towards less green rather than more. */
++#define ELVSS_UNKNOWN       ELVSS_PX01
++
 +#define RD(o)     ({ uint32_t v_ = *(volatile uint32_t *)(dsi_base + (o)); \
 +		     __asm__ volatile("dmb oshld" ::: "memory"); v_; })
 +#define WR(o, v)  do { \
@@ -123,6 +169,68 @@
 +	return i ? 0 : -1;
 +}
 +
++/* The panel the bootloader configured. Reads /chosen/bootargs and looks for
++ * AMB577PX01 / AMB577MQ01 inside the msm_drm.dsi_display0= token; the token is
++ * copied into tok for the log. Never writes anything. */
++static int
++dsi_panel_from_dt(char *tok, unsigned toklen)
++{
++	static const char key[] = "msm_drm.dsi_display0=";
++	DTEntry chosen;
++	void const *prop = NULL;
++	unsigned int size = 0;
++	const char *start, *end, *s, *p;
++	unsigned n = 0;
++
++	if (tok && toklen) {
++		tok[0] = 0;
++	}
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, "bootargs", &prop, &size) != kSuccess ||
++	    !prop || !size) {
++		return ELVSS_PANEL_UNKNOWN;
++	}
++	start = (const char *)prop;
++	end = start + size;		/* the property need not be NUL-terminated */
++
++	for (s = start; s < end; ++s) {
++		unsigned k = 0;
++
++		/* A kernel module parameter starts a token. */
++		if (s != start && s[-1] != ' ') {
++			continue;
++		}
++		while (key[k] && s + k < end && s[k] == key[k]) {
++			++k;
++		}
++		if (key[k]) {
++			continue;	/* not this token */
++		}
++		p = s + k;		/* just past the '=' */
++		while (p + n < end && p[n] != ' ' && p[n] != 0 &&
++		    n + 1u < toklen) {
++			if (tok) {
++				tok[n] = p[n];
++			}
++			++n;
++		}
++		if (tok) {
++			tok[n] = 0;
++		}
++		break;
++	}
++
++	for (n = 0; tok && tok[n]; ++n) {
++		if (strncmp(tok + n, "AMB577PX01", 10) == 0) {
++			return ELVSS_PANEL_PX01;
++		}
++		if (strncmp(tok + n, "AMB577MQ01", 10) == 0) {
++			return ELVSS_PANEL_MQ01;
++		}
++	}
++	return ELVSS_PANEL_UNKNOWN;
++}
++
 +/* Packet ("word count / data type / last|long / payload", 0xff padded; the
 + * bytes both msm drivers hand the DMA engine) through the command TPG FIFO,
 + * then wait for DMA_DONE. True when the packet went out. */
@@ -194,23 +302,59 @@
 +static void
 +starq_dsi_elvss(void)
 +{
-+	uint8_t cmds[MAXCMDS][MAXBYTES], lens[MAXCMDS];
++	uint8_t cmds[MAXCMDS][MAXBYTES] = {{0}};
++	uint8_t lens[MAXCMDS] = {0};
 +	char arg[96] = {0};
-+	unsigned n = 0, i, j, line;
-+	int on = 1;
++	char tok[96] = {0};
++	unsigned n = 0, i, j, line, elvss;
++	int on = 1, panel;
 +
 +	(void)PE_parse_boot_argn("starqdsi", &on, sizeof(on));
 +	if (!on) {
 +		printf("STARQ DSI: disabled (starqdsi=0)\n");
 +		return;
 +	}
-+	if (!PE_parse_boot_arg_str("starqelvss", arg, sizeof(arg))) {
-+		return;			/* no boot-arg: send nothing */
++	panel = dsi_panel_from_dt(tok, sizeof(tok));
++	elvss = panel == ELVSS_PANEL_MQ01 ? ELVSS_MQ01 : ELVSS_UNKNOWN;
++	printf("STARQ DSI: panel=%s%s%s\n",
++	    panel == ELVSS_PANEL_PX01 ? "PX01" :
++	    panel == ELVSS_PANEL_MQ01 ? "MQ01" : "UNKNOWN",
++	    tok[0] ? " name=" : "", tok);
++
++	if (PE_parse_boot_arg_str("starqelvss", arg, sizeof(arg))) {
++		if (strcmp(arg, "off") == 0) {
++			printf("STARQ DSI: starqelvss=off, nothing sent\n");
++			return;
++		}
++		if (dcs_parse(arg, cmds, lens, &n)) {
++			printf("STARQ DSI: bad hex list \"%s\": nothing sent\n", arg);
++			return;
++		}
++		printf("STARQ DSI: starqelvss from the boot-arg, %u command(s)\n", n);
++	} else {
++		/* The default policy: level-1 key, one 4-byte 0xB5, key off. */
++		static const uint8_t key_on[3] = { 0xf0, 0x5a, 0x5a };
++		static const uint8_t key_off[3] = { 0xf0, 0xa5, 0xa5 };
++		uint8_t b5[4] = { 0xb5, ELVSS_TSET, ELVSS_MPS, 0 };
++
++		b5[3] = (uint8_t)elvss;
++		memcpy(cmds[0], key_on, 3);
++		lens[0] = 3;
++		memcpy(cmds[1], b5, 4);
++		lens[1] = 4;
++		memcpy(cmds[2], key_off, 3);
++		lens[2] = 3;
++		n = 3;
++		if (panel == ELVSS_PANEL_UNKNOWN) {
++			printf("STARQ DSI: no AMB577 panel name in "
++			    "/chosen/bootargs, assuming PX01: the higher-volume "
++			    "starqlte panel and the more compensated value, so a "
++			    "wrong guess errs towards less green\n");
++		}
++		printf("STARQ DSI: default elvss tset=%#x mps=%#x elvss=%#x\n",
++		    ELVSS_TSET, ELVSS_MPS, elvss);
 +	}
-+	if (dcs_parse(arg, cmds, lens, &n)) {
-+		printf("STARQ DSI: bad hex list \"%s\": nothing sent\n", arg);
-+		return;
-+	}
++
 +	dsi_base = ml_io_map(DSI0_PA, 0x400);
 +	if (!dsi_base) {
 +		printf("STARQ DSI: DSI0 mapping failed\n");
@@ -224,7 +368,9 @@
 +	}
 +	/* Video mode: the packet has to leave during blanking. The 2.2 controller
 +	 * can emit it on a chosen scan line; that line comes from ACTIVE_V (its
-+	 * end field is v_sync + v_back_porch + v_active), never invented here. */
++	 * end field is v_sync + v_back_porch + v_active), never invented here.
++	 * In command mode there is nothing to dodge and no schedule is
++	 * programmed (the vendor driver does not program one either). */
 +	line = RD(R_ACT_V) >> 16;
 +	if ((RD(R_CTRL) & 2u) && line) {	/* VID_MODE_EN */
 +		WR(R_SCHED, (1u << 28) | (line & 0xffffu));
@@ -248,10 +394,11 @@
 +	WR(R_SCHED, 0);
 +}
 +
- /* ------------------------------------------------------------------ */
++/* ------------------------------------------------------------------ */
  
  void
-@@ -1089,5 +1326,6 @@ starqltechn_hw_init(void)
+ starqltechn_hw_init(void)
+@@ -1085,5 +1462,6 @@
  	}
  	printf("STARQ: gcc=%#x tlmm=%#x\n", STARQ_GCC_PA, STARQ_TLMM_NORTH_PA);
  	ts_start();
