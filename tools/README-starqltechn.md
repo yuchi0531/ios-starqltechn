@@ -53,7 +53,9 @@ Bixby is the separate button on the left edge, below the volume rocker.
 
 ## 0. Back up
 
-Phone in TWRP, USB attached:
+**This step needs TWRP.** odin4 writes partitions but cannot read them, so the
+backup is still `starq-flash.sh`; there is no Odin equivalent. Phone in TWRP,
+USB attached:
 
 ```sh
 tools/starq-flash.sh boot-name     # confirm the real /dev/block/by-name/ nodes
@@ -186,6 +188,66 @@ zones. Together with the cross build and the pack command above, that is the
 whole of what has been executed for this port.
 
 ## 3. Flash the boot image
+
+There are two paths and they are not interchangeable. Both write the same
+partition; only TWRP can read anything back.
+
+| | **A. odin4 (Linux-native)** | **B. TWRP + `adb dd`** |
+| --- | --- | --- |
+| Host tools | `odin4` (libusb) + `python3` | `adb` + TWRP on the phone |
+| Phone mode | Download Mode (`Vol Down + Bixby + Power`, then `Vol Up`) | Recovery (`Vol Up + Bixby + Power`) |
+| Write boot | `starq-odin.sh flash` -> Odin/Thor protocol, one archive | `starq-flash.sh boot` -> `dd` to `/dev/block/by-name/boot` |
+| Pre-flight | **mandatory** `odin4 --check-only`: archive checked against the phone's own PIT | magic + header parse only |
+| Read back | **impossible** — write-only | `backup`, `pull-log`, `boot-name` |
+| Recovery from a bad image | `restore AP_TAR` (stock AP, **replaces the Windows-only Odin route**) | `starq-flash.sh boot backup/starq/boot.img` |
+| Needs root on host once | yes, for the udev rule | no |
+
+### A. Odin4: no TWRP, no adb, no Windows
+
+odin4 speaks the **Thor USB protocol — the same one Android's Odin uses** — so
+the boot image can be written straight from Linux. No TWRP, no `adb push`, no
+Wine. Build it once (the GUI needs Qt6 and is not needed here):
+
+```sh
+git clone https://github.com/Llucs/odin4 && cd odin4
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DODIN4_BUILD_GUI=OFF
+cmake --build build --parallel $(nproc)
+```
+
+```sh
+tools/starq-odin.sh install-udev                            # sudo: 04e8 download-mode USB access
+tools/starq-odin.sh build starq-boot.img                    # -> starq-boot.tar
+tools/starq-odin.sh check starq-boot.tar                    # GATE: needs the phone, writes nothing
+tools/starq-odin.sh flash starq-boot.tar --yes              # re-runs check, then writes + reboots
+```
+
+`check` is the gate, and it is not optional: `flash` runs it itself and refuses
+to continue if it fails. It is `odin4 --check-only -a TAR`, which downloads the
+PIT from the phone and matches every archive entry against it; nothing is
+written. `odin4` is looked up in `$ODIN4`, then `PATH`, then `./build/odin4`,
+then `/tmp/opencode/odin4/build/odin4`. Add `--md5` to `build` for a `.tar.md5`
+with a verified trailer (the name must end in `.tar.md5`).
+
+**The member name must match this phone's PIT.** odin4 takes each tar entry's
+basename, lowercases it, strips `.img`/`.bin`/`.ext4`/`.lz4`, and compares it to
+the PIT `file_name` and `partition_name`; an entry that matches nothing is a
+hard error, and two entries for one partition is also an error. `boot.img` is
+the default because that is the name Samsung's AP archives use — this repo has
+no dump of the phone's own PIT, so it is a convention, not a verified fact.
+`--member-name` (and `--entry NAME=PATH` for other partitions) overrides it,
+and `check` is how you find out before writing anything.
+
+A bad boot image still needs a **stock AP**, and odin4 can do that too:
+
+```sh
+tools/starq-odin.sh restore AP_G9600_....tar.md5 --yes      # stock AP, --reboot
+```
+
+### B. TWRP + `adb dd` (unchanged)
+
+Still the only way to read the phone: pull logs and pstore, back up
+partitions, list `/dev/block/by-name/`. **odin4 cannot replace
+`starq-flash.sh backup` or `pull-log` — it is write-only.**
 
 ```sh
 tools/starq-flash.sh boot starq-boot.img      # asks for confirmation; --yes to skip
