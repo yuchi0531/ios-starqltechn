@@ -12,10 +12,11 @@
 @@ -62,6 +62,10 @@
  MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
  MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
- MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
-+# -DSWEET selects the board-neutral Qualcomm machine layer (see STARQLTECHN.h,
-+# which ARM64_BOARD_CONFIG_STARQLTECHN additionally selects); some sources test
-+# it before including any header, so it must come from the compiler options.
+-MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
++# -DSWEET selects the board-neutral Qualcomm machine layer (defined by SWEET.h,
++# which STARQLTECHN.h includes, for both Qualcomm boards); some sources test it
++# before including any header, so it must come from the compiler options.
++MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET -DSWEET -march=armv8.2-a+crypto
 +MACHINE_FLAGS_ARM64_STARQLTECHN = -DARM64_BOARD_CONFIG_STARQLTECHN -DSWEET -march=armv8.2-a+crypto
  
  
