@@ -38,9 +38,15 @@
  *                      e.g. starqelvss=b5,8f,dc,0a or
  *                      starqelvss=f0,5a,5a;b5,8f,dc,0a: bytes are hex, ','
  *                      separates the bytes of one command, ';' the commands.
- *                      starqelvss=off disables the override entirely. Absent ->
- *                      the panel-aware default (see STARQ_ELVSS_*), which is
- *                      ON: level-1 key, "b5 8f dc <elvss>", level-1 key off.
+ *                      starqelvss=off disables the override AND every DSI
+ *                      register access (no mode probe either). Absent -> the
+ *                      panel-aware default (see STARQ_ELVSS_*), which is ON:
+ *                      level-1 key, "b5 8f dc <elvss>", level-1 key off.
+ *   starqdsi=0         same guarantee as starqelvss=off, independently: no DSI
+ *                      register access at all. Same name and meaning as the
+ *                      kernel-side switch in xnu/patches/0083. Either switch
+ *                      is enough; this one is the one to reach for when the
+ *                      payload cmdline still has to carry starqelvss= values.
  *   starqmps=VAL       byte 2 (MPS) of the default 0xB5 write, 1-2 hex digits.
  *                      Default 0xdc, which is what the vendor driver uses above
  *                      39 cd; 0xcc below that.
@@ -146,8 +152,8 @@
  *
  * with <elvss> = 0x16 on AMB577PX01 and 0x0a on AMB577MQ01, from the panel name
  * in the DTB's /chosen/bootargs. An unknown panel gets the PX01 value (see
- * dsi.h for why). starqelvss=<hex list> overrides all of it and
- * starqelvss=off disables it.
+ * dsi.h for why). starqelvss=<hex list> overrides all of it; starqelvss=off and
+ * starqdsi=0 both turn the whole DSI path off before any register is read.
  *
  * STARQ_ELVSS_DEFAULT is only for baking a *specific* sequence into an image
  * instead; leave it empty for the policy above. */
@@ -430,6 +436,41 @@ static const char *arg_val(const volatile char *cmd, const char *needle)
 	return 0;
 }
 
+/* Copy the value of the switch "needle" into buf (bounded, NUL-terminated) and
+ * return 1, or return 0 when the switch is absent. arg_val() hands back the
+ * rest of the line, so "starqelvss=off starqdsi=0" would otherwise be one
+ * value - and boot-args are documented to be combined freely. */
+static int arg_tok(const volatile char *cmd, const char *needle, char *buf,
+		   unsigned len)
+{
+	const char *v = arg_val(cmd, needle);
+	unsigned n = 0;
+
+	if (!v || !len)
+		return 0;
+	while (v[n] && v[n] != ' ' && n + 1 < len) {
+		buf[n] = v[n];
+		n++;
+	}
+	buf[n] = 0;
+	return 1;
+}
+
+static int streq(const char *a, const char *b)
+{
+	while (*a && *a == *b)
+		a++, b++;
+	return *a == 0 && *b == 0;
+}
+
+/* The whole value is one token: "starqdsisw=10" must not match "1". */
+static int arg_is(const volatile char *cmd, const char *needle, const char *want)
+{
+	char b[16];
+
+	return arg_tok(cmd, needle, b, sizeof(b)) && streq(b, want);
+}
+
 static int parse_hex(const char *s, uint64_t *val)
 {
 	uint64_t v = 0;
@@ -525,22 +566,31 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr,
 	 * vendor display driver reads msm_drm.dsi_display0=<panel node>:config0
 	 * (dsi_display.c:7061-7064). The payload cmdline says nothing about the
 	 * panel.
+	 *
+	 * It is kept unconditional even though starqelvss=off / starqdsi=0 turn
+	 * the DSI path off, for two reasons: it is pure string parsing with no
+	 * MMIO, and it cannot see those switches yet - they live in the payload
+	 * cmdline, which is only located below, after the initrd is validated.
+	 * So the lines are labelled "STARQ panel:" rather than "STARQ DSI:": no
+	 * output of this loader ever claims DSI register access that the switch
+	 * has forbidden, and the panel identity stays in the log when the DSI
+	 * path is off.
 	 */
 	char bootargs[STARQ_BOOTARGS_MAX];
 	char panel_token[STARQ_PANEL_TOKEN_MAX];
 	int panel;
 
 	if (fdt_chosen_str(dtb, "bootargs", bootargs, sizeof(bootargs))) {
-		out("STARQ DSI: bootloader cmdline: ");
+		out("STARQ panel: bootloader cmdline: ");
 		out(bootargs);
 		out("\n");
 	} else {
-		out("STARQ DSI: no /chosen/bootargs in the DTB\n");
+		out("STARQ panel: no /chosen/bootargs in the DTB\n");
 		bootargs[0] = 0;
 	}
 	panel = starq_dsi_panel_from_cmdline(bootargs, panel_token,
 					    sizeof(panel_token));
-	out("STARQ DSI: panel=");
+	out("STARQ panel: panel=");
 	out(panel == STARQ_PANEL_PX01 ? "PX01" :
 	    panel == STARQ_PANEL_MQ01 ? "MQ01" : "UNKNOWN");
 	if (panel_token[0]) {
@@ -680,35 +730,60 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr,
 	 * MDSS driver; see dsi.c for the register sequence and what is
 	 * deliberately left alone.
 	 *
-	 * The DSI_CTRL probe runs even with starqelvss=off, and that is a
-	 * deliberate risk: it is read-only, S-Boot leaves MDSS clocked, and the
-	 * enable/video/command bits are the deciding evidence for the whole
-	 * display plan (a read of an *unclocked* MDSS block can hang the
-	 * interconnect on Qualcomm, which would cost an Odin flash). If that
-	 * ever happens, starqelvss=off is the switch that must become "no
-	 * register access at all" again.
+	 * Both kill switches are pure string checks and are made *before* the
+	 * first register access: starqelvss=off, and starqdsi=0 (the same name
+	 * and meaning as the kernel-side switch). Either one means "no DSI
+	 * register access at all", not merely "do not send" - the mode probe
+	 * itself reads DSI_CTRL, and a read of an *unclocked* MDSS block can
+	 * hang the interconnect on Qualcomm, which would cost an Odin flash.
+	 * That is the whole reason these switches exist, so when one is set
+	 * starq_dsi_init() is never called: no probe, no read, no write.
 	 *
 	 * Every step here logs and continues: a display experiment must never
 	 * stop XNU from starting. */
 	{
-		const char *elvss = arg_val(p->cmdline, "starqelvss=");
-		const char *mps_arg = arg_val(p->cmdline, "starqmps=");
+		char elvss_buf[BOOT_LINE_LENGTH], dsi_buf[16], mps_buf[16];
+		const char *elvss = arg_tok(p->cmdline, "starqelvss=", elvss_buf,
+					    sizeof(elvss_buf)) ? elvss_buf : 0;
+		const char *mps_arg = arg_tok(p->cmdline, "starqmps=", mps_buf,
+					      sizeof(mps_buf)) ? mps_buf : 0;
 		const char *spec = elvss ? elvss : STARQ_ELVSS_DEFAULT;
 		unsigned mps = STARQ_ELVSS_MPS_DEFAULT;
+		int elvss_off = starq_elvss_off(spec);
+		int dsi_off = 0, dsi_bad = 0;
 		uint64_t v;
 
-		if (mps_arg && parse_hex(mps_arg, &v) && v <= 0xff)
-			mps = (unsigned)v;
-		else if (mps_arg)
-			out("STARQ DSI: bad starqmps, using 0xdc\n");
+		/* starqdsi=0 is the kernel's spelling: a value of zero disables,
+		 * a non-zero value leaves the default (on) alone. */
+		if (arg_tok(p->cmdline, "starqdsi=", dsi_buf, sizeof(dsi_buf))) {
+			if (!parse_hex(dsi_buf, &v))
+				dsi_bad = 1;
+			else if (v == 0)
+				dsi_off = 1;
+		}
 
-		if (starq_dsi_init(STARQ_DSI_CTRL_PA, STARQ_DSI_PHY_PA) != 0)
-			out("STARQ DSI: controller not probed\n");
-
-		if (starq_elvss_off(spec)) {
-			out("STARQ DSI: starqelvss=off, nothing sent\n");
+		if (elvss_off || dsi_off) {
+			out("STARQ DSI: ");
+			if (elvss_off)
+				out("starqelvss=off");
+			if (elvss_off && dsi_off)
+				out(" and ");
+			if (dsi_off)
+				out("starqdsi=0");
+			out(", no DSI register access at all\n");
 		} else {
-			if (arg_val(p->cmdline, "starqdsisw=1"))
+			/* Only now may a DSI register be touched. */
+			if (dsi_bad)
+				out("STARQ DSI: bad starqdsi, DSI left on\n");
+			if (mps_arg && parse_hex(mps_arg, &v) && v <= 0xff)
+				mps = (unsigned)v;
+			else if (mps_arg)
+				out("STARQ DSI: bad starqmps, using 0xdc\n");
+
+			if (starq_dsi_init(STARQ_DSI_CTRL_PA, STARQ_DSI_PHY_PA) != 0)
+				out("STARQ DSI: controller not probed\n");
+
+			if (arg_is(p->cmdline, "starqdsisw=", "1"))
 				starq_dsi_set_sw_trigger(1);
 			/* The boot-arg wins; otherwise spec is the compiled
 			 * default, which is empty by default so the policy in

@@ -165,6 +165,10 @@ extern unsigned starq_dsi_trace_n;
  * the real addresses, so the host test can inspect every write. */
 extern uint32_t starq_dsi_regs_ctrl[STARQ_DSI_CTRL_SIZE / 4];
 extern uint32_t starq_dsi_regs_phy[STARQ_DSI_PHY_SIZE / 4];
+/* Register reads since the test last cleared it. Loader.c must leave this at 0
+ * when starqelvss=off or starqdsi=0: the point of those switches is that not
+ * one DSI register is touched, not just that nothing is sent. */
+extern unsigned starq_dsi_rd_n;
 /* The DMA-visible packet buffer (STARQ_DSI_CMD_BUF_PA on the phone). */
 extern uint8_t starq_dsi_cmd_buf[STARQ_DCS_MAX_LEN + 8];
 /* bit0: the memory path never completes, bit1: the FIFO path never completes.

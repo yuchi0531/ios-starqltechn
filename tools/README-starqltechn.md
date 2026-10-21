@@ -299,7 +299,9 @@ is untouched and still produces the same `mkbootimg` command line.
    probes the panel name out of `msm_drm.dsi_display0=...`
    (`panel=PX01|MQ01|UNKNOWN` plus the raw token). No register is touched, and
    it runs before the payload is validated so the answer is in the log even if
-   the boot fails later.
+   the boot fails later. Its lines are prefixed `STARQ panel:`, not `STARQ
+   DSI:`, because it is string parsing and stays on even when the DSI path is
+   switched off (step 10).
 5. Validates the SWEETXNU v1 payload: magic, version, `nsegs` (1..32), the
    segment table inside the ramdisk, `adt_off`/`adt_size` inside the ramdisk,
    `phys_base`+`mem_size` inside `0xa2000000 + 0x18000000`, `entry_va` and
@@ -315,12 +317,15 @@ is untouched and still produces the same `mkbootimg` command line.
 9. Writes the ADT at `kernel_end`, `boot_args` on the next page boundary,
    `deviceTreeP` as a **virtual** address, `topOfKernelData`,
    `memSizeActual`, and the framebuffer geometry from `FB_*`.
-10. Probes DSI0 read-only and logs `DSI_CTRL` with its enable/video/cmd bits,
+10. **Unless `starqelvss=off` or `starqdsi=0` is on the payload cmdline**, probes
+   DSI0 read-only and logs `DSI_CTRL` with its enable/video/cmd bits,
    `DSI_ACK_ERR_STATUS` and `DSI_TIMEOUT_STATUS`, then the plain-words mode
-   verdict; a down link turns every later send into a no-op.
+   verdict; a down link turns every later send into a no-op. Either switch is
+   checked *before* the first register access and skips the whole DSI path —
+   see "The two DSI kill switches" below.
 11. Sends the ELVSS sequence: the `starqelvss=` list if given, nothing for
-   `starqelvss=off`, otherwise the panel-aware default (`f0 5a 5a` /
-   `b5 8f dc <elvss>` / `f0 a5 a5`). A failure logs and continues.
+   `starqelvss=off` or `starqdsi=0`, otherwise the panel-aware default
+   (`f0 5a 5a` / `b5 8f dc <elvss>` / `f0 a5 a5`). A failure logs and continues.
 12. Jumps with MMU, D-cache and I-cache off and `x0` = `boot_args` PA.
 
 ### The framebuffer test pattern
@@ -398,7 +403,8 @@ msm_drm.dsi_display0=ss_dsi_panel_S6E3HA8_AMB577PX01_WQHD:config0
 matches it against `panel->name`). The loader prints the token it found, then
 `panel=PX01`, `panel=MQ01` or `panel=UNKNOWN`. It reads the **DTB's** bootargs,
 not the payload cmdline — the payload cmdline is ours and says nothing about the
-panel.
+panel. These lines are prefixed `STARQ panel:` rather than `STARQ DSI:`: no MMIO
+is involved, and they stay in the log when the DSI path is switched off.
 
 **The override is ON by default.** `starqelvss=` is now a *tuning* knob, not the
 only way to send anything: with no boot-arg the loader and the kernel both send
@@ -408,9 +414,49 @@ the panel-appropriate three-command sequence above. To turn it off:
 tools/starq-boot.sh --cmdline "starqelvss=off" ...
 ```
 
-With `off`, nothing is sent — but the read-only `DSI_CTRL` probe still runs,
-because it is what tells you whether the display is even in the mode the
-framebuffer path assumes (next section).
+With `off`, **nothing in the DSI path runs at all**: the loader checks the switch
+before the first register access, so the read-only `DSI_CTRL` mode probe is
+skipped too and not one DSI register is read or written. That is the point of
+the switch — a read of an **unclocked** MDSS block can hang Qualcomm's
+interconnect, which costs an Odin flash to recover — so it must not depend on
+S-Boot having left MDSS clocked. The log says which switch fired and what it
+guarantees:
+
+```
+STARQ DSI: starqelvss=off, no DSI register access at all
+```
+
+The panel name is still logged (it is pure string parsing from
+`/chosen/bootargs`, no MMIO), under its own `STARQ panel:` prefix rather than
+`STARQ DSI:`, so no output line claims DSI activity the switch has forbidden:
+
+```
+STARQ panel: panel=PX01 name=ss_dsi_panel_S6E3HA8_AMB577PX01_WQHD:config0
+```
+
+### The two DSI kill switches
+
+`starqdsi=0` is the **second, independent** switch, with the same name and
+meaning as the one the kernel side already uses (patch 0083). Either one is
+enough, in any order and alongside other boot-args:
+
+| Boot-arg | Loader (this port) | Kernel (patch 0083) |
+| --- | --- | --- |
+| `starqelvss=off` | no DSI register access at all | nothing sent |
+| `starqdsi=0` | no DSI register access at all | nothing sent |
+| both | same, and the log names both | same |
+
+```sh
+# the same kill, for when the payload cmdline has to keep starqelvss= values
+tools/starq-boot.sh --cmdline "starqdsi=0" ...
+# both set: the log reads "starqelvss=off and starqdsi=0, ..."
+tools/starq-boot.sh --cmdline "starqelvss=off starqdsi=0" ...
+```
+
+A *non-zero* `starqdsi=` (or a value that is not hex) leaves DSI on and is
+logged (`bad starqdsi, DSI left on`), so the default is never turned off by a
+typo. The values are read as whole tokens: `starqelvss=off starqfb=0` is still
+the `off` switch, and `nostarqdsi=0` / `starqdsioff=1` are not switches at all.
 
 To tune, pass your own hex list; it replaces the whole default sequence:
 
@@ -434,11 +480,11 @@ is logged and `0xdc` is kept.
 | Switch | Where | Effect |
 | --- | --- | --- |
 | *(none)* | loader + kernel | the default: `f0 5a 5a` / `b5 8f dc <elvss>` / `f0 a5 a5`, `<elvss>` from the panel name |
-| `starqelvss=off` | loader + kernel | nothing is sent |
+| `starqelvss=off` | loader + kernel | **loader: no DSI register access at all**; kernel: nothing is sent |
+| `starqdsi=0` | loader + kernel | same as `starqelvss=off`, independently; either switch works |
 | `starqelvss=<hex list>` | loader + kernel | replaces the default sequence entirely |
 | `starqmps=cc` | loader only | byte 2 of the default sequence |
 | `starqdsisw=1` | loader only | skip the scan-line scheduling, trigger the DMA immediately (mainline's behaviour) |
-| `starqdsi=0` | kernel only | disable the kernel-side send |
 
 Two places send it, for one reason:
 
@@ -476,7 +522,8 @@ and in both ramoops zones, so a failed attempt is readable afterwards with
 `tools/starq-flash.sh pull-log` even when the panel looks black:
 
 ```
-STARQ DSI: panel=PX01 name=ss_dsi_panel_S6E3HA8_AMB577PX01_WQHD:config0
+STARQ panel: panel=PX01 name=ss_dsi_panel_S6E3HA8_AMB577PX01_WQHD:config0
+STARQ DSI: ctrl=0xae94000 phy=0xae94400 buf=0x9f7ff000
 STARQ DSI: DSI_CTRL=0x000001b3 en=1 video=1 cmd=0 hwver=0x00000001 status=0x0 lanes=0xb
 STARQ DSI: ack_err=0x00000000 timeout=0x00000000
 STARQ DSI: panel in VIDEO mode: the bootloader framebuffer is being scanned out
@@ -515,6 +562,12 @@ STARQ DSI: panel in COMMAND mode (vendor DT agrees, dsi_cmd_mode): FB_BASE is NO
 sends nothing, logs `LINK DOWN (DSI_CTRL.ENABLE=0)` and XNU still starts. The
 same line also prints `DSI_ACK_ERR_STATUS` and `DSI_TIMEOUT_STATUS`, so a link
 that is up but erroring shows it.
+
+None of this runs at all with `starqelvss=off` or `starqdsi=0`: there is no
+probe line to read, because the switch forbids the register access the probe
+needs. If the log shows `no DSI register access at all` and you still want the
+mode verdict, drop the switch on one boot — accepting the risk that a hung
+interconnect costs an Odin flash.
 
 ### pstore logging
 

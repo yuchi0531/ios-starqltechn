@@ -234,6 +234,8 @@ static uint64_t boot_ok_args(const char *cmdline, const char *bootargs)
 #define BA_PX01 "console=ttyMSM0 androidboot.bootloader=G9600ZHS9FQL1 " \
 		"msm_drm.dsi_display0=ss_dsi_panel_S6E3HA8_AMB577PX01_WQHD:config0 " \
 		"androidboot.hardware=qcom"
+#define BA_PX01_TOKEN \
+	"ss_dsi_panel_S6E3HA8_AMB577PX01_WQHD:config0"
 #define BA_MQ01 "console=ttyMSM0 androidboot.bootloader=G9600ZHS9FQL1 " \
 		"msm_drm.dsi_display0=ss_dsi_panel_S6E3HA8_AMB577MQ01_WQHD:config0 " \
 		"androidboot.hardware=qcom"
@@ -249,7 +251,10 @@ static uint64_t boot_ok_args(const char *cmdline, const char *bootargs)
 #define D_LINK_OFF	0x000001b4u	/* clock on, controller disabled */
 
 /* Reset the DSI register file to a plausible live link and re-init the
- * driver, so the next boot starts from a known state. */
+ * driver, so the next boot starts from a known state. The read counter is
+ * cleared too: "did the loader touch a DSI register at all" is a separate
+ * question from "what did it write". starqdsisw is process state in dsi.c and
+ * would otherwise leak from one boot() to the next. */
 static void dsi_link(uint32_t ctrl)
 {
 	memset(starq_dsi_regs_ctrl, 0, sizeof(starq_dsi_regs_ctrl));
@@ -259,6 +264,8 @@ static void dsi_link(uint32_t ctrl)
 	starq_dsi_regs_ctrl[0x028 / 4] = 0x0c5c0080u;	/* active_v start/end */
 	starq_dsi_regs_phy[0x0ec / 4] = 1;		/* refgen ready */
 	starq_dsi_trace_n = 0;
+	starq_dsi_rd_n = 0;
+	starq_dsi_set_sw_trigger(0);
 }
 
 /* How many register writes hit offset `off` with value `val`. */
@@ -268,6 +275,17 @@ static unsigned dsi_count(uint32_t off, uint32_t val)
 
 	for (unsigned i = 0; i < starq_dsi_trace_n; i++)
 		if (starq_dsi_trace[i].off == off && starq_dsi_trace[i].val == val)
+			n++;
+	return n;
+}
+
+/* How many register writes hit offset `off` with a non-zero value. */
+static unsigned dsi_count_nz(uint32_t off)
+{
+	unsigned n = 0;
+
+	for (unsigned i = 0; i < starq_dsi_trace_n; i++)
+		if (starq_dsi_trace[i].off == off && starq_dsi_trace[i].val)
 			n++;
 	return n;
 }
@@ -634,14 +652,62 @@ int main(void)
 		check(boot_ok("starqfb=0") != 0, "booted");
 		check(dsi_count(0x090, 1) == 3, "no /chosen/bootargs still uses the default");
 
-		/* --- starqelvss=off: nothing sent, but the probe still runs --- */
-		dsi_link(D_LINK_CMD);	/* the register says command mode */
-		starq_dsi_trace_n = 0;
+		/* --- starqelvss=off: not one DSI register is accessed ---
+		 * The point of the switch is the avoidance of the mode probe
+		 * itself: a read of an unclocked MDSS block can hang the
+		 * interconnect, so "nothing sent" is not good enough. The host
+		 * driver counts every rd32(), so this asserts the strong
+		 * property rather than the weak one. */
+		dsi_link(D_LINK_CMD);	/* a probe would read 0x1b5 */
 		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
 		check(boot_ok_args("starqfb=0 starqelvss=off", BA_PX01) != 0, "booted");
+		check(starq_dsi_rd_n == 0, "starqelvss=off: 0 DSI register reads (%u)",
+		      starq_dsi_rd_n);
 		check(dsi_count(0x090, 1) == 0, "starqelvss=off sends nothing (%u)",
 		      dsi_count(0x090, 1));
-		check(log_has("starqelvss=off, nothing sent"), "and says so");
+		check(log_has("starqelvss=off, no DSI register access at all"),
+		      "and says that no register was touched");
+		check(!log_has("DSI_CTRL=") && !log_has("panel in COMMAND mode") &&
+		      !log_has("STARQ DSI: ctrl="),
+		      "no probe line, no mode verdict, no controller address");
+		/* The panel probe is string parsing only: it still runs, and it is
+		 * labelled STARQ panel:, not STARQ DSI:, so the log never claims
+		 * DSI activity the switch has forbidden. */
+		check(log_has("STARQ panel: panel=PX01 name=" BA_PX01_TOKEN),
+		      "the panel token is still logged, as STARQ panel:");
+
+		/* --- starqdsi=0: the same guarantee, independently --- */
+		dsi_link(D_LINK_CMD);
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		check(boot_ok_args("starqfb=0 starqdsi=0", BA_MQ01) != 0, "booted");
+		check(starq_dsi_rd_n == 0, "starqdsi=0: 0 DSI register reads (%u)",
+		      starq_dsi_rd_n);
+		check(dsi_count(0x090, 1) == 0, "starqdsi=0 sends nothing (%u)",
+		      dsi_count(0x090, 1));
+		check(log_has("STARQ DSI: starqdsi=0, no DSI register access at all"),
+		      "and names the switch that fired");
+		check(!log_has("DSI_CTRL=") && !log_has("STARQ DSI: ctrl="),
+		      "no probe line and no controller address");
+
+		/* --- both switches: off wins, and the log says which fired --- */
+		dsi_link(D_LINK_CMD);
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		check(boot_ok_args("starqfb=0 starqelvss=off starqdsi=0", BA_PX01) != 0,
+		      "booted");
+		check(starq_dsi_rd_n == 0, "both switches: 0 DSI register reads (%u)",
+		      starq_dsi_rd_n);
+		check(log_has("STARQ DSI: starqelvss=off and starqdsi=0, "
+			      "no DSI register access at all"),
+		      "both are named, and the stronger statement holds");
+
+		/* --- neither switch: the probe does run and does read --- */
+		dsi_link(D_LINK_CMD);	/* the register says command mode */
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		check(boot_ok_args("starqfb=0", BA_PX01) != 0, "booted");
+		check(starq_dsi_rd_n > 0, "no switch: the probe reads registers (%u)",
+		      starq_dsi_rd_n);
+		check(log_has("STARQ DSI: ctrl=0xae94000 phy=0xae94400"),
+		      "the controller and PHY addresses are logged");
 		check(log_has("DSI_CTRL=0x000001b5 en=1 video=0 cmd=1"),
 		      "the mode probe line prints all eight hex digits");
 		check(log_has("ack_err=0x00000000 timeout=0x00000000"),
@@ -649,6 +715,19 @@ int main(void)
 		check(log_has("panel in COMMAND mode"), "command mode recognised");
 		check(log_has("ack_err=") && log_has("timeout="),
 		      "DSI_ACK_ERR_STATUS and DSI_TIMEOUT_STATUS are logged");
+
+		/* --- a non-zero or unparsable starqdsi leaves DSI on --- */
+		dsi_link(D_LINK_VIDEO);
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		check(boot_ok_args("starqfb=0 starqdsi=1", BA_PX01) != 0, "booted");
+		check(starq_dsi_rd_n > 0 && dsi_count(0x090, 1) == 3,
+		      "starqdsi=1 keeps DSI on (%u reads, %u sends)",
+		      starq_dsi_rd_n, dsi_count(0x090, 1));
+		dsi_link(D_LINK_VIDEO);
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		check(boot_ok_args("starqfb=0 starqdsi=zz", BA_PX01) != 0, "booted");
+		check(starq_dsi_rd_n > 0 && log_has("bad starqdsi"),
+		      "an unparsable starqdsi is logged and DSI stays on");
 
 		/* --- a boot-arg still overrides everything --- */
 		dsi_link(D_LINK_VIDEO);
@@ -659,6 +738,33 @@ int main(void)
 		check(dsi_count(0x090, 1) == 1 && log_has("dcs b5 19 dc 0a"),
 		      "starqelvss= replaces the default (1 command, as given)");
 		check(log_has("explicit sequence"), "and is logged as explicit");
+
+		/* --- the switch is a token, not the rest of the cmdline ---
+		 * arg_val() returns everything after "needle"; before the
+		 * token-bounded read, "starqelvss=off starqfb=0" compared as
+		 * "off starqfb=0" and the kill switch silently did not fire. */
+		dsi_link(D_LINK_CMD);
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		check(boot_ok_args("starqfb=0 starqelvss=off trailing=1",
+				   BA_PX01) != 0, "booted");
+		check(starq_dsi_rd_n == 0,
+		      "starqelvss=off with args after it still reads no register (%u)",
+		      starq_dsi_rd_n);
+		check(log_has("starqelvss=off, no DSI register access at all"),
+		      "and fires with trailing boot-args present");
+		/* ...and the reverse order, which the boot-arg list invites. */
+		dsi_link(D_LINK_CMD);
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		check(boot_ok_args("starqdsi=0 starqelvss=off", BA_PX01) != 0, "booted");
+		check(starq_dsi_rd_n == 0 && dsi_count(0x090, 1) == 0,
+		      "either order: 0 reads, 0 sends (%u)", starq_dsi_rd_n);
+		/* A lookalike must still not match. */
+		dsi_link(D_LINK_VIDEO);
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		check(boot_ok_args("starqfb=0 nostarqdsi=0 starqdsioff=1", BA_PX01) != 0,
+		      "booted");
+		check(starq_dsi_rd_n > 0 && dsi_count(0x090, 1) == 3,
+		      "nostarqdsi=0 / starqdsioff=1 do not disable DSI");
 
 		/* --- starqmps= overrides byte 2 of the default --- */
 		dsi_link(D_LINK_VIDEO);
@@ -834,13 +940,21 @@ int main(void)
 		check(boot_ok_args("starqdsisw=1 starqelvss=b5,8f,dc,16", BA_PX01) != 0,
 		      "booted");
 		check(dsi_count(0x100, 0) == 0, "starqdsisw=1 leaves DMA_SCHED alone");
+		/* ...and only the exact token: "10" is not "1". */
+		dsi_link(D_LINK_VIDEO);
+		starq_dsi_trace_n = 0;
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		check(boot_ok_args("starqdsisw=10 starqelvss=b5,8f,dc,16", BA_PX01) != 0,
+		      "booted");
+		check(dsi_count_nz(0x100) > 0,
+		      "starqdsisw=10 does not match starqdsisw=1 (schedule is programmed)");
 
 		/* --- a command-mode link never programs the schedule --- */
 		dsi_link(D_LINK_CMD);
 		starq_dsi_trace_n = 0;
 		check(boot_ok_args("starqfb=0", BA_PX01) != 0, "booted");
-		check(dsi_count(0x100, 0) == 0 && dsi_count(0x090, 1) == 3,
-		      "command mode: 3 commands, no DMA schedule");
+		check(dsi_count_nz(0x100) == 0 && dsi_count(0x090, 1) == 3,
+		      "command mode: 3 commands, no DMA schedule programmed");
 
 		/* --- a lookalike boot-arg must not match --- */
 		dsi_link(D_LINK_VIDEO);

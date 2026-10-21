@@ -243,12 +243,14 @@ uint32_t starq_dsi_regs_ctrl[STARQ_DSI_CTRL_SIZE / 4];
 uint32_t starq_dsi_regs_phy[STARQ_DSI_PHY_SIZE / 4];
 struct starq_dsi_trace_ent starq_dsi_trace[STARQ_DSI_TRACE_MAX];
 unsigned starq_dsi_trace_n;
+unsigned starq_dsi_rd_n;
 uint8_t starq_dsi_cmd_buf[STARQ_DCS_MAX_LEN + 8] __attribute__((aligned(8)));
 int starq_dsi_sim_stall;
 static int starq_dsi_use_fifo;
 
 static uint32_t rd32(uintptr_t base, uint32_t off)
 {
+	starq_dsi_rd_n++;
 	return base == STARQ_DSI_PHY_PA ? starq_dsi_regs_phy[off / 4]
 					: starq_dsi_regs_ctrl[off / 4];
 }
