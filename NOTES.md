@@ -31,6 +31,12 @@ port is unaffected.
   `loader.c`, `build.sh`, `host_test.c`, `Makefile`) - the S8-proven validation
   chain, XNU-RAM zeroing, dual-zone ramoops logging, and the framebuffer test
   pattern that decides the display work.
+- 2026-10-21 (this session) DSI DCS transmit for the panel ELVSS override:
+  `shim/starqltechn/dsi.{c,h}` (DSI0 command DMA, read-only register snapshot,
+  `starqelvss=` hex-list parser), wired into `loader.c` after the framebuffer
+  pattern, and `xnu/patches/0083-starq-dsi-elvss.patch` for the same write from
+  the kernel. Details and the boot-arg syntax are in
+  `tools/README-starqltechn.md`, "Panel ELVSS override over DSI".
 
 **The two regressions, and why they generalise to any new board.** Both came from
 adding a second machine config to a tree that had only ever had one; neither was

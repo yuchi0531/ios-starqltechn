@@ -1,0 +1,260 @@
+--- a/bsd/dev/starqltechn_hw.c
++++ b/bsd/dev/starqltechn_hw.c
+@@ -39,6 +39,7 @@ extern kern_return_t thread_terminate(thread_t);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ 
+ void starqltechn_hw_init(void);
++static void starq_dsi_elvss(void);
+ int starqltechn_battery_read(unsigned *percent, unsigned *mv, int *ma,
+     int *external, int *charging, int *full);
+ 
+@@ -1076,6 +1077,242 @@ starqltechn_battery_read(unsigned *percent, unsigned *mv, int *ma,
+ 	return 0;
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* Panel ELVSS override over DSI0: the 0xB5 DCS command                */
++/* ------------------------------------------------------------------ */
++/*
++ * Android fixes this panel's green tint with a Magisk module that puts
++ * ELVSS temperature compensation on the extreme-cold table:
++ *   samsung,elvss_tx_cmds_revA = [29 01 00 00 00 00 04 b5 19 dc 0a ...]
++ *   (ss_dsi_panel_S6E3HA8_AMB577PX01_WQHD, sdm845-sec-starqlte DTSI)
++ * i.e. one DSI long write of 4 bytes: DCS 0xB5, TSET, MPS, ELVSS offset. The
++ * payload depends on the panel and may need the level-1 key unlock (F0 5A 5A)
++ * first, so it comes from the boot-arg (starqelvss=b5,8f,dc,0a, commands
++ * separated by ';'); nothing is sent without it, because a wrong 0xB5 leaves
++ * the panel with a bad black level until the next reboot.
++ *
++ * shim/starqltechn/dsi.c sends the same bytes from the loader; this copy
++ * exists because XNU needs minutes to reach the GUI and the panel can be
++ * power-cycled in between. Only the FIFO path is used
++ * (dsi_ctrl_hw_cmn_kickoff_fifo_command): the memory path needs a buffer the
++ * DSI DMA can read, i.e. one from the MDSS SMMU domain that no driver here
++ * owns. Offsets: techpack dsi_ctrl_reg.h, which is mainline dsi.xml.h + 4.
++ * No PHY, PLL, video-timing or clock register is written (DSI_CTRL is read
++ * only) and the command path is restored after use.
++ */
++#define DSI0_PA   0x0ae94000u
++#define R_CTRL    0x004		/* DSI_CTRL */
++#define R_STATUS  0x008		/* engine|dma busy */
++#define R_ACT_V   0x028		/* DSI_VIDEO_MODE_ACTIVE_V, read only */
++#define R_DMACTRL 0x03c
++#define R_DMALEN  0x04c
++#define R_TRIG    0x090
++#define R_SCHED   0x100
++#define R_INT     0x110
++#define R_TPG     0x15c
++#define R_TPGIN   0x17c
++#define R_TPGRST  0x1ec
++#define MAXCMDS   8u
++#define MAXBYTES  64u
++#define DPOLL     40000u	/* delay(1) per round: > one 16 ms frame */
++#define RD(o)     ({ uint32_t v_ = *(volatile uint32_t *)(dsi_base + (o)); \
++		     __asm__ volatile("dmb oshld" ::: "memory"); v_; })
++#define WR(o, v)  do { \
++		__asm__ volatile("dmb oshst" ::: "memory"); \
++		*(volatile uint32_t *)(dsi_base + (o)) = (v); \
++		__asm__ volatile("dsb osh" ::: "memory"); \
++	} while (0)
++
++static vm_offset_t dsi_base;
++
++/* Hex digit value, or -1. */
++static int
++nyb(char c)
++{
++	if (c >= '0' && c <= '9') {
++		return c - '0';
++	}
++	if (c >= 'a' && c <= 'f') {
++		return c - 'a' + 10;
++	}
++	if (c >= 'A' && c <= 'F') {
++		return c - 'A' + 10;
++	}
++	return -1;
++}
++
++/* "b5,8f,dc,0a" / "f0,5a,5a;b5,8f,dc,0a": one or two hex digits per byte, ','
++ * inside a command, ';' between commands. All or nothing - a malformed string
++ * returns -1 with *n = 0, so it never becomes a partial send. That rejects an
++ * empty byte, a trailing ';', a three-digit field and a space (which the
++ * boot-arg would split into two tokens anyway). */
++static int
++dcs_parse(const char *s, uint8_t out[][MAXBYTES], uint8_t *lens, unsigned *n)
++{
++	unsigned i = 0, l;
++	int v, hi;
++
++	*n = 0;
++	while (s && *s) {
++		if (i == MAXCMDS) {
++			return -1;
++		}
++		for (l = 0;;) {
++			if ((v = nyb(*s)) < 0) {
++				return -1;
++			}
++			if ((hi = nyb(*++s)) >= 0) {	/* second digit */
++				v = (v << 4) | hi;
++				++s;
++			}
++			if (v > 0xff || l >= MAXBYTES) {
++				return -1;
++			}
++			out[i][l++] = (uint8_t)v;
++			if (*s != ',') {
++				break;
++			}
++			++s;
++		}
++		/* Only ',' (consumed above), ';' or the end may follow a byte:
++		 * "b5,8fdc" is not two bytes. */
++		if (*s && *s != ';') {
++			return -1;
++		}
++		if (*s && !*++s) {
++			return -1;		/* trailing ';' */
++		}
++		lens[i++] = (uint8_t)l;
++	}
++	*n = i;
++	return i ? 0 : -1;
++}
++
++/* Packet ("word count / data type / last|long / payload", 0xff padded; the
++ * bytes both msm drivers hand the DMA engine) through the command TPG FIFO,
++ * then wait for DMA_DONE. True when the packet went out. */
++static bool
++dsi_fifo_tx(const uint8_t *c, unsigned clen)
++{
++	uint8_t buf[MAXBYTES + 8] = {0};
++	uint32_t v, *w = (uint32_t *)buf;
++	unsigned words, i, k;
++
++	if (clen <= 2) {			/* short write: params in WC */
++		buf[0] = c[0];
++		buf[1] = clen == 2 ? c[1] : 0;
++		buf[2] = clen == 2 ? 0x15 : 0x05;
++		buf[3] = 0x80;			/* last packet */
++		i = 4;
++	} else {
++		buf[0] = (uint8_t)clen;		/* DCS long write */
++		buf[2] = 0x39;
++		buf[3] = 0x80 | 0x40;		/* last | long */
++		for (i = 0; i < clen; ++i) {
++			buf[4 + i] = c[i];
++		}
++		i += 4;
++	}
++	words = (i + 3u) / 4u;			/* pad to a 4-byte multiple */
++	for (; i < words * 4u; ++i) {
++		buf[i] = 0xff;
++	}
++	for (k = 0; k < DPOLL && (RD(R_STATUS) & 0x3u); ++k) {
++		delay(1);
++	}
++	if (k == DPOLL) {
++		printf("STARQ DSI: cmd engine never idle status=%#x\n",
++		    RD(R_STATUS));
++		return false;
++	}
++	WR(R_TPG, (1u << 1) | (1u << 2) | (3u << 16));	/* custom pattern */
++	for (k = 0; k < words; ++k) {
++		WR(R_TPGIN, w[k]);
++	}
++	/* "Hardware requires an extra DWORD (set to zero) if the length of the
++	 * command buffer is odd DWORDS." */
++	if (words & 1u) {
++		WR(R_TPGIN, 0);
++	}
++	v = RD(R_DMACTRL) | (1u << 28);		/* embedded: header from FIFO */
++	WR(R_DMACTRL, v & ~((1u << 31) | (1u << 30) | (1u << 26)));
++	WR(R_DMALEN, words * 4u);
++	WR(R_INT, RD(R_INT) | 1u);		/* clear a stale completion */
++	WR(R_TRIG, 1);
++	for (k = 0; k < DPOLL; ++k) {
++		v = RD(R_INT);
++		if (v & 1u) {			/* DMA_DONE */
++			WR(R_INT, v | 1u);
++			return true;
++		}
++		delay(1);
++	}
++	printf("STARQ DSI: DMA done timeout int=%#x status=%#x\n", v,
++	    RD(R_STATUS));
++	return false;
++}
++
++/* Called from starqltechn_hw_init(), once the scheduler runs, so delay() and
++ * printf() are safe. PE_parse_boot_arg_str() rather than _argn(): the latter
++ * turns a numeric-looking value into a binary integer, and "starqelvss=29"
++ * has to arrive as those two characters. */
++static void
++starq_dsi_elvss(void)
++{
++	uint8_t cmds[MAXCMDS][MAXBYTES], lens[MAXCMDS];
++	char arg[96] = {0};
++	unsigned n = 0, i, j, line;
++	int on = 1;
++
++	(void)PE_parse_boot_argn("starqdsi", &on, sizeof(on));
++	if (!on) {
++		printf("STARQ DSI: disabled (starqdsi=0)\n");
++		return;
++	}
++	if (!PE_parse_boot_arg_str("starqelvss", arg, sizeof(arg))) {
++		return;			/* no boot-arg: send nothing */
++	}
++	if (dcs_parse(arg, cmds, lens, &n)) {
++		printf("STARQ DSI: bad hex list \"%s\": nothing sent\n", arg);
++		return;
++	}
++	dsi_base = ml_io_map(DSI0_PA, 0x400);
++	if (!dsi_base) {
++		printf("STARQ DSI: DSI0 mapping failed\n");
++		return;
++	}
++	printf("STARQ DSI: dsi0=%#x cmds=%u ctrl=%#x active_v=%#x\n", DSI0_PA, n,
++	    RD(R_CTRL), RD(R_ACT_V));
++	if (!(RD(R_CTRL) & 1u)) {		/* DSI_CTRL.ENABLE */
++		printf("STARQ DSI: controller off, nothing sent\n");
++		return;
++	}
++	/* Video mode: the packet has to leave during blanking. The 2.2 controller
++	 * can emit it on a chosen scan line; that line comes from ACTIVE_V (its
++	 * end field is v_sync + v_back_porch + v_active), never invented here. */
++	line = RD(R_ACT_V) >> 16;
++	if ((RD(R_CTRL) & 2u) && line) {	/* VID_MODE_EN */
++		WR(R_SCHED, (1u << 28) | (line & 0xffffu));
++		printf("STARQ DSI: sched line=%u\n", line);
++	}
++	for (i = 0; i < n; ++i) {
++		printf("STARQ DSI: dcs %02x", cmds[i][0]);
++		for (j = 1; j < lens[i]; ++j) {
++			printf(" %02x", cmds[i][j]);
++		}
++		printf("\n");
++		if (!dsi_fifo_tx(cmds[i], lens[i])) {
++			printf("STARQ DSI: command %u failed\n", i);
++			break;
++		}
++		printf("STARQ DSI: command %u sent\n", i);
++	}
++	WR(R_TPG, 0);			/* leave the TPG and the schedule */
++	WR(R_TPGRST, 1);		/* the way we found them */
++	WR(R_TPGRST, 0);
++	WR(R_SCHED, 0);
++}
++
+ /* ------------------------------------------------------------------ */
+ 
+ void
+@@ -1089,5 +1326,6 @@ starqltechn_hw_init(void)
+ 	}
+ 	printf("STARQ: gcc=%#x tlmm=%#x\n", STARQ_GCC_PA, STARQ_TLMM_NORTH_PA);
+ 	ts_start();
++	starq_dsi_elvss();
+ }
+ #endif /* ARM64_BOARD_CONFIG_STARQLTECHN */
