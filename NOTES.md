@@ -2,6 +2,156 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-21: starqltechn ELVSS/green-screen fix (Magisk module ported into the drivers) <<<
+
+**Ask.** The user's S9 panel is physically degraded and shows a green tint. On Android
+they work around it with a Magisk module whose entire payload is one line:
+
+```
+echo -15, -14, 0, 1, 30, 40, 60, 80, 100 > /sys/class/lcd/panel/temperature
+```
+
+Do the equivalent from our own code. We have no MDSS/DSI driver - only the link S-Boot
+leaves behind - so "our code" means the loader and XNU talking DCS directly.
+
+**What that line actually does (vendor `s6e3ha8` driver).**
+- `ss_temperature_store()` (`drivers/gpu/drm/msm/samsung/ss_dsi_panel_sysfs.c:1082`) is
+  `sscanf(buf, "%d", &vdd->temperature)`: **only the leading `-15` is parsed**, the other
+  eight numbers are inert. Default is 20.
+- The value drives the panel's **ELVSS temperature compensation** and reaches it as the
+  TSET byte of DCS `0xB5`: `tx_buf[1] = temperature > 0 ? temperature : BIT(7) | -temperature`,
+  so -15 becomes **`0x8F`**.
+- **Correction to the obvious reading of that command.** The S9 does not run the generic
+  interpolation engine: `samsung_interpolation_init` is registered only by `AMB638RD01`,
+  which is the **Note 9**. The S9 panels use a hardcoded 15-entry array gated at
+  `candela_level <= 14`. So at normal brightness the module changes **exactly one byte**,
+  TSET `0x14`/`0x19` -> `0x8F`; the ELVSS offset in byte 3 only moves at <= 14 nit.
+
+**Two S9 panels, both compiled for starqlte**, so the write cannot be a constant:
+
+| Panel | `0xB5` form | index-0 (brightest) | byte 3 | ours |
+| --- | --- | --- | --- | --- |
+| `AMB577MQ01` | 4-byte | `b5 19 dc 0a` | **0x0a** | `b5 8f dc 0a` |
+| `AMB577PX01` | 24-byte | `b5 19 dc 16` | **0x16** | `b5 8f dc 16` |
+
+(`AMB638RD01` = Note 9, `AMB622NP01`/`AMS622MR01` = S9+ - none of them this board.)
+
+**`0xB5` is in the level-1 key protected bank**: `F0 5A 5A` before, `F0 A5 A5` after.
+Proven by PX01's own gray-spot test, which wraps `0xB5` exactly that way
+(`dtsi_px01.dtsi:1905-1919`), and by `ss_elvss()` setting `*level_key = LEVEL1_KEY`.
+
+**Why a 4-byte partial write and not PX01's 24-byte page.** PX01's payload carries a
+per-panel **OTP calibration byte at index 23** (`elvss_value1`, read back with
+`samsung,elvss_rx_cmds_revA = [06 01 00 00 00 00 01 B5 02 16]`). Synthesising that byte
+from the DTS template would send `0x00` and throw the panel's black-level trim away.
+`b5 8f dc <elvss>` is **native for MQ01**, and on PX01 leaves bytes 4..23 - the OTP trim
+included - untouched. Bytes 1..3 are the only ones the vendor driver ever computes anyway.
+
+**Why no DCS read.** `0xB5` is not readable as a payload: the read is `rx_len = 2` at a
+`0xB0`-selected offset (`0x16` PX01 / `0x17` MQ01). A full read needs three paginated
+passes plus BTA handling on an unproven link - not worth it. No DCS read was implemented;
+if it ever becomes necessary, `0xD6` after a `0xB0` page select is the vendor's mechanism.
+
+**Panel identity is free.** S-Boot's own command line carries it in the DTB's
+`/chosen/bootargs`:
+
+```
+msm_drm.dsi_display0=ss_dsi_panel_S6E3HA8_AMB577PX01_WQHD:config0
+```
+
+parsed by `dsi_display.c:7061` and matched against `panel->name` in
+`ss_dsi_panel_common.c:4862`. No MMIO, so it works even with the DSI path switched off.
+`starqmps`/`elvss` follow the table above; `UNKNOWN` sends PX01's `0x16` (higher-volume
+panel, and the larger value errs towards less green). Both sides read `/chosen` - the
+kernel side with `SecureDTLookupEntry`/`SecureDTGetProperty` (patch 0083), because
+`PE_parse_boot_argn` cannot see a DT property.
+
+**Corrected display fact - this changes the display plan.** The vendor DTS declares
+**both** S9 panels `dsi_cmd_mode` (`dtsi_mq01.dtsi:66`, `dtsi_px01.dtsi:70`), not video
+mode. This file and `tools/README-starqltechn.md` both previously assumed video mode.
+If it really is command mode the panel holds the frame in its own GRAM, and **writing
+pixels into the bootloader framebuffer at `0x9d400000` will not appear at all** -
+MDSS `write_memory_start` plus a DSI bring-up becomes mandatory, not optional. The DT is
+not the evidence; the runtime register is, so the loader now prints on every boot:
+
+```
+STARQ DSI: DSI_CTRL=0x........ en=N video=N cmd=N hwver=... status=... lanes=...
+```
+
+`video=1` -> framebuffer path works. `cmd=1` + `video=0` -> it does not. `en=0` -> link
+down, nothing is sent, XNU still starts. **Not yet verified on hardware.**
+
+**Built (commits on `main`, pushed).** `7536e7d` - `shim/starqltechn/dsi.{c,h}`: DSI0
+command-path transmit (DCS long/short write), register offsets from the vendor techpack,
+packet word layout `[WC lo][WC hi][DT|VC][last|long|BTA]`, command DMA placed in blanking
+via `DSI_DMA_SCHEDULE_CTRL` for controller >= 2.2, FIFO fallback (no SMMU dependency)
+when the memory path faults, bounded polling with full status dumps (`wait_idle`,
+`trigger_and_wait` dump `int`/`status` on their iteration bound instead of hanging), and no
+retry: one memory attempt, one FIFO attempt, then an error the caller logs and survives. It
+**never writes** any `DSI_PHY_*` register, video timing, `DSI_CLK_CTRL`/lane config, or
+`DSI_CTRL` itself - the host test asserts that mechanically by snapshotting 21 controller +
+13 PHY registers (`ro_ctrl[]`/`ro_phy[]`) before and after a full default sequence.
+`85e34aa` was the first kernel patch (0083 v1); its policy was **superseded**, not
+extended, by `62c484c` (panel-aware, 4-byte partial write, on by default). `69e0811`
+rewrote 0083 to match `62c484c`; `7c5212e` is docs; `940485b` is the off-switch safety fix.
+
+**Boot-args (default is ON, no boot-arg needed):**
+
+| Boot-arg | Where | Effect |
+| --- | --- | --- |
+| *(none)* | loader + kernel | `f0 5a 5a` / `b5 8f dc <elvss>` / `f0 a5 a5`, `<elvss>` from `dsi_display0` |
+| `starqelvss=off` | loader + kernel | **no DSI register access at all** (probe included); kernel sends nothing |
+| `starqdsi=0` | loader + kernel | same guarantee, independent switch, same name as the kernel side |
+| `starqmps=<hex>` | loader only | byte 2 of the default (`cc` = the vendor's <= 39 cd value) |
+| `starqdsisw=1` | loader only | skip the vblank schedule, plain software trigger (mainline behaviour) |
+| `starqelvss=a,b,c;d,e,f` | loader + kernel | arbitrary override, up to 8 commands x 64 bytes, all-or-nothing parsing |
+
+**Safety lesson worth keeping.** `starqelvss=off` originally still called
+`starq_dsi_init()`, which *reads* DSI registers - so the documented emergency switch did
+not avoid the one hazard it existed for: an MMIO read of an **unclocked** MDSS block can
+hang Qualcomm's interconnect, and that costs an Odin flash to recover. Separately,
+`arg_val()` was not token-bounded, so `starqelvss=off starqfb=0` was read as the value
+`"off starqfb=0"` and the switch **never fired** - even though the boot-args are
+documented to be combined freely. Both are fixed in `940485b` (`arg_tok()` truncates at
+the first space, both switches are evaluated before any register is touched) and the host
+test now asserts **0 register reads**, not "no packet sent": the old assertion passed
+while `DSI_CTRL` was being read. Testing the negative case is not enough if the
+assertion measures the wrong side effect.
+
+**Validation.**
+
+| Check | Result |
+| --- | --- |
+| CI `39611433630` (`MACHINE_CONFIG=STARQLTECHN`) | success -> `kernel.development.starqltechn`, 17,172,688 bytes, Mach-O arm64 cputype `0x100000c`, 26 load commands |
+| CI `39612796715` (`MACHINE_CONFIG=SWEET`) | success (no regression) |
+| `bash shim/starqltechn/build.sh` | arm64 Image, 56,096 bytes |
+| `make -C shim/starqltechn` | 174 host checks, 0 failures |
+| `python3 tools/validate-repo.py` | 83 patches contiguous 0001-0083 |
+| `tools/starq-boot.sh` end to end | 16,658,656-byte image, header intact, kernel SHA-1 verified, `SEANDROIDENFORCE` present (`/tmp/opencode/starq-ios-boot.img`, scratch) |
+
+Operational note: `/tmp` is a 5 GB tmpfs here and filled up during the artifact
+downloads; `/tmp/opencode/*` scratch trees need periodic cleanup or the boot-image step
+fails on a truncated write.
+
+**Physics caveat, unchanged.** Forcing -15 C compensation at room temperature is a bias,
+not a calibration: it lowers ELVSS until the tint goes, which can also **crush blacks**
+and slightly raise panel power. It is a per-unit judgement, which is why every field is a
+boot-arg. The panel resets on the next power cycle, so a plain reboot reverts it.
+
+**Open, needs the phone (in order):**
+1. Read the first boot log (`tools/starq-flash.sh pull-log`) for the `DSI_CTRL` line and
+   the `STARQ panel:` token: `en=`/`video=`/`cmd=` decides the display plan, the token
+   confirms `PX01` vs `MQ01` and therefore byte 3.
+2. Confirm the tint actually changes with `b5 8f dc <elvss>`. If it does not, the write
+   reached the panel but the row is not what the module exploited - do not assume success
+   from "command sent".
+3. If unchanged: try `starqelvss=` overrides (`starqmps=cc`, a different byte 3), and only
+   then the 24-byte PX01 form with **byte 23 echoed from a real read**, never synthesised.
+4. Check whether the fix survives suspend/resume, or whether S-Boot re-sends the panel
+   init on every resume (it re-inits the panel on boot; a resume may be a different path).
+5. `starqelvss=off` is the revert if any DSI access hangs the boot - and it now guarantees
+   zero register reads, so it is also the safe diagnostic boot.
+
 ### >>> UPDATE 2026-10-21: starqltechn (Galaxy S9 SDM845) port started | kernel + boot chain GREEN, nothing on hardware yet <<<
 
 **Decision.** Port to `starqltechn` (Galaxy S9 SM-G9600 / SC-02K, SDM845) with the
