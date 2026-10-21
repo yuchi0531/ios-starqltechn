@@ -243,13 +243,16 @@ Odin. If `userdata` was overwritten with the iOS root, format it in TWRP.
   `--ram-base/--ram-size` (which `starq-boot.sh` does) silences its warning.
 - Framebuffer address and panel geometry (`0x9d400000`, 1440×2960) come from
   mainline's `framebuffer_mem` node, not from a live dump.
-- **Does the panel scan out of `0x9d400000` at all?** Unknown, and it decides
-  the display work: if the bootloader leaves the display scanning out of that
-  buffer, our CPU-copy path works exactly as on sweet; if the panel is in
-  command mode with its own GRAM, nothing written there reaches it and MDSS/DSI
-  has to be programmed. The loader paints a test pattern to answer this - it is
-  step 1 of the first boot (step 4 above) and is described in "The framebuffer
-  test pattern" below.
+- **Does the panel scan out of `0x9d400000` at all?** Likely **no**: both S9
+  panels are declared `dsi_cmd_mode` in the vendor DTS
+  (`dtsi_px01.dtsi:70`, `dtsi_mq01.dtsi:66`), i.e. command mode with their own
+  GRAM, in which case nothing written to that buffer reaches the panel and MDSS
+  `write_memory_start` plus a DSI bring-up has to be programmed. This is the
+  single most important open question for the display. The loader answers it
+  two ways: it paints a test pattern (`starqfb=1`, described in "The
+  framebuffer test pattern" below) *and* it prints DSI_CTRL's enable/video/cmd
+  bits, which is the deciding evidence regardless of what is on the panel — see
+  "Read this before trusting the framebuffer path".
 - The `by-name` node names are unconfirmed. `tools/starq-flash.sh` resolves
   `/dev/block/by-name/<part>`, then `bootdevice/by-name`, then
   `platform/soc/*/by-name`, and never hardcodes `sdaN`, but the names
@@ -278,35 +281,47 @@ is untouched and still produces the same `mkbootimg` command line.
 | `start.S` | arm64 Linux Image header + entry. EL1, MMU and caches off, `x0` = DTB (S-Boot's contract). Position independent; passes its own run-time load address to C so the loader can tell whether zeroing XNU's RAM would erase itself. |
 | `loader.ld` | Linked at 0, 32 KiB stack after `.bss`, no secondary stacks. |
 | `loader.c` | The S-Boot-specific loader (see below). |
-| `dsi.c` | DSI0 command-DMA transmit (`starq_dsi_dcs_write`), the `starqelvss=` hex-list parser and the read-only register snapshot. See "Panel ELVSS override over DSI" above. |
+| `dsi.c` | DSI0 command-DMA transmit (`starq_dsi_dcs_write`), the panel probe from `/chosen/bootargs`, the `starqelvss=`/`starqmps=` parsers, the panel-aware default sequence and the read-only `DSI_CTRL` mode probe. See "Panel ELVSS override over DSI" above. |
 | `build.sh` | Compile + optional pack. `build.sh STOCK_BOOT.img PAYLOAD.bin OUT.img [DTBH.bin]`, packed by `tools/starq_mkboot.py`, so `mkbootimg` is not needed. |
 | `Makefile` | `make -C shim/starqltechn` builds and runs the host test. |
 
 ### What it does, in order
 
 1. Validates the entry: EL1, and `x0` must point at something `shim/fdt.c` can
-   parse.
+   parse (`fdt_chosen_u64` / `fdt_chosen_str`, both bounds-checked against the
+   header's `totalsize` because the tree is bootloader input).
 2. Reads `/chosen/linux,initrd-start` / `linux,initrd-end` - the same two
    properties the sweet shim uses, which is why the payload format and
    `tools/mkpayload.py` are unchanged. Requires the initrd in the low 4 GB bank
    (`0x80000000..0x100000000`).
 3. Optionally paints the framebuffer test pattern (below).
-4. Validates the SWEETXNU v1 payload: magic, version, `nsegs` (1..32), the
+4. Reads `/chosen/bootargs` (the **DTB**, not our payload cmdline), logs it, and
+   probes the panel name out of `msm_drm.dsi_display0=...`
+   (`panel=PX01|MQ01|UNKNOWN` plus the raw token). No register is touched, and
+   it runs before the payload is validated so the answer is in the log even if
+   the boot fails later.
+5. Validates the SWEETXNU v1 payload: magic, version, `nsegs` (1..32), the
    segment table inside the ramdisk, `adt_off`/`adt_size` inside the ramdisk,
    `phys_base`+`mem_size` inside `0xa2000000 + 0x18000000`, `entry_va` and
    `kernel_end` at or above `virt_base`, and every segment inside the RAM
    window.
-5. Refuses to zero RAM it still needs: the payload, the loader image itself,
+6. Refuses to zero RAM it still needs: the payload, the loader image itself,
    the framebuffer, the ramoops region and the DTB must all be outside the XNU
    window.
-6. **Zeroes `phys_base..phys_base+mem_size`.** This is the S8's hard-won step:
+7. **Zeroes `phys_base..phys_base+mem_size`.** This is the S8's hard-won step:
    S-Boot leaves the previous OS's RAM in place, and XNU hung in
    `vm_mem_bootstrap` on the S8 depending on how the phone had been rebooted.
-7. Copies each segment, zeroes the `vmsize - file_size` tail, cleans to PoC.
-8. Writes the ADT at `kernel_end`, `boot_args` on the next page boundary,
+8. Copies each segment, zeroes the `vmsize - file_size` tail, cleans to PoC.
+9. Writes the ADT at `kernel_end`, `boot_args` on the next page boundary,
    `deviceTreeP` as a **virtual** address, `topOfKernelData`,
    `memSizeActual`, and the framebuffer geometry from `FB_*`.
-9. Jumps with MMU, D-cache and I-cache off and `x0` = `boot_args` PA.
+10. Probes DSI0 read-only and logs `DSI_CTRL` with its enable/video/cmd bits,
+   `DSI_ACK_ERR_STATUS` and `DSI_TIMEOUT_STATUS`, then the plain-words mode
+   verdict; a down link turns every later send into a no-op.
+11. Sends the ELVSS sequence: the `starqelvss=` list if given, nothing for
+   `starqelvss=off`, otherwise the panel-aware default (`f0 5a 5a` /
+   `b5 8f dc <elvss>` / `f0 a5 a5`). A failure logs and continues.
+12. Jumps with MMU, D-cache and I-cache off and `x0` = `boot_args` PA.
 
 ### The framebuffer test pattern
 
@@ -339,100 +354,167 @@ logs `fb pattern ON`/`OFF`.
 ### Panel ELVSS override over DSI (`starqelvss=`)
 
 This panel's green tint is an ELVSS (black-level) calibration problem, not a
-gamma or a framebuffer one. On Android a Magisk module fixes it by rewriting the
-panel's ELVSS temperature compensation to the extreme-cold table; the vendor
-driver's own command list is `samsung,elvss_tx_cmds_revA` in
-`ss_dsi_panel_S6E3HA8_AMB577PX01_WQHD` (`sdm845-sec-starqlte` DTSI):
+gamma or a framebuffer one, and the fix is one 4-byte DCS write.
+
+**What the Android Magisk module actually changes.** Not the whole ELVSS table:
+it forces the panel's ELVSS *temperature* byte onto the extreme-cold row,
+`TSET 0x8F` = `BIT(7) | 15`, i.e. **-15 °C**. At normal brightness that is the
+module's only real effect — MPS stays `0xDC` above 39 cd — so the write is
 
 ```
-29 01 00 00 00 00 04 b5 19 dc 0a   ->   DCS 0xB5 with TSET=0x19 MPS=0xdc ELVSS=0x0a
+f0 5a 5a              level-1 key on   (0xB5 is in the protected bank)
+b5 8f dc <elvss>      TSET 0x8f, MPS 0xdc, ELVSS offset
+f0 a5 a5              level-1 key off
 ```
 
-i.e. **one DSI long write of four bytes: `0xB5`, TSET (temperature), MPS,
-ELVSS offset.** S-Boot leaves MDSS + DSI0 + the panel powered and streaming, so
-the loader can send that packet over the DSI command DMA without any display
-driver, and a wrong value is undone by the next reboot (the panel resets).
+**Why 4 bytes and not the whole page.** `0xB5` is *not* readable as a payload:
+both S9 panels expose only a **2-byte** read at a `0xB0`-selected offset
+(`samsung,elvss_rx_cmds_revA = [06 01 00 00 00 00 01 B5 02 16]`, `rx_len=2`,
+read offset `0x16`; `0x17` on MQ01), so there is no read-modify-write here and
+no DCS read at all. `AMB577MQ01` writes `0xB5` natively as 4 bytes
+(`b5 19 dc 0a`, 26 brightness entries). `AMB577PX01` uses a 24-byte form but its
+driver only ever *changes* bytes 1, 2, 3 and 23 — and **byte 23 is a per-panel
+OTP black-level trim that must be preserved, not synthesised**: writing `0x00`
+there throws the panel's calibration away. A 4-byte write leaves PX01's bytes
+4..23, including that trim, exactly as they are.
 
-**The bytes are yours to choose** — the port computes nothing. Pass them on the
-boot-args, which `tools/starq-boot.sh` already forwards to XNU:
+**The two panels differ in byte 3.** Index-0 (brightest) values from the vendor
+DTS:
+
+| Panel | Vendor command | TSET | MPS | ELVSS | Ours |
+| --- | --- | --- | --- | --- | --- |
+| `AMB577PX01` (starqlte) | `b5 19 dc 16 …` | 0x19 | 0xdc | **0x16** | `b5 8f dc 16` |
+| `AMB577MQ01` | `b5 19 dc 0a` | 0x19 | 0xdc | **0x0a** | `b5 8f dc 0a` |
+
+So it cannot be a constant. **Detection is free of risk and needs no register
+access**: S-Boot's own command line lives in the DTB's `/chosen/bootargs` and the
+vendor display driver names the panel in it,
+
+```
+msm_drm.dsi_display0=ss_dsi_panel_S6E3HA8_AMB577PX01_WQHD:config0
+```
+
+(`dsi_display.c:7061-7064` parses the property, `ss_dsi_panel_common.c:4862-4876`
+matches it against `panel->name`). The loader prints the token it found, then
+`panel=PX01`, `panel=MQ01` or `panel=UNKNOWN`. It reads the **DTB's** bootargs,
+not the payload cmdline — the payload cmdline is ours and says nothing about the
+panel.
+
+**The override is ON by default.** `starqelvss=` is now a *tuning* knob, not the
+only way to send anything: with no boot-arg the loader and the kernel both send
+the panel-appropriate three-command sequence above. To turn it off:
 
 ```sh
-# one command
-tools/starq-boot.sh --cmdline "starqelvss=b5,8f,dc,0a" ...
-# level-1 key unlock first, then the ELVSS write
-tools/starq-boot.sh --cmdline "starqelvss=f0,5a,5a;b5,8f,dc,0a" ...
-# several writes, applied left to right
---cmdline "starqelvss=f0,5a,5a;b5,8f,dc,0a;b5,8f,cc,0c"
+tools/starq-boot.sh --cmdline "starqelvss=off" ...
 ```
 
-Syntax: bytes are one or two hex digits, `,` separates the bytes of one command,
-`;` separates commands, up to 8 commands of 64 bytes. Nothing else is accepted:
-an empty byte (`b5,,dc`), a trailing `,` or `;`, a three-digit field or a space
-makes the whole string invalid and **nothing at all is sent** (the log says
-`bad hex list ... nothing sent`). There is no partial application.
+With `off`, nothing is sent — but the read-only `DSI_CTRL` probe still runs,
+because it is what tells you whether the display is even in the mode the
+framebuffer path assumes (next section).
 
-Default: **nothing is sent, and DSI0 is not even read.** No boot-arg means the
-loader does not touch the display block at all: a register read of an unclocked
-MDSS can hang Qualcomm's interconnect, and that would cost an Odin flash, so the
-read-only snapshot only happens when a transfer is actually about to be
-attempted. A compiled-in default exists but is empty (`STARQ_ELVSS_DEFAULT` in
-`shim/starqltechn/loader.c`); to bake values into an image:
+To tune, pass your own hex list; it replaces the whole default sequence:
 
 ```sh
-CFLAGS_EXTRA='-DSTARQ_ELVSS_DEFAULT="b5,8f,dc,0a"' BOARD=starqltechn shim/build.sh ...
+# the vendor's unmodified value for comparison (PX01)
+tools/starq-boot.sh --cmdline "starqelvss=f0,5a,5a;b5,19,dc,16;f0,a5,a5" ...
+# a different MPS: 0xcc is the vendor's value below 39 cd
+tools/starq-boot.sh --cmdline "starqmps=cc" ...
+# ...or say it explicitly in the list
+--cmdline "starqelvss=f0,5a,5a;b5,8f,cc,16;f0,a5,a5"
 ```
+
+Syntax of a list: bytes are one or two hex digits, `,` separates the bytes of one
+command, `;` separates commands, up to 8 commands of 64 bytes. Nothing else is
+accepted: an empty byte (`b5,,dc`), a trailing `,` or `;`, a three-digit field or
+a space makes the whole string invalid and **nothing at all is sent** (the log
+says `bad hex list ... nothing sent`). There is no partial application.
+`starqmps=<1-2 hex digits>` only changes byte 2 of the default; an invalid value
+is logged and `0xdc` is kept.
+
+| Switch | Where | Effect |
+| --- | --- | --- |
+| *(none)* | loader + kernel | the default: `f0 5a 5a` / `b5 8f dc <elvss>` / `f0 a5 a5`, `<elvss>` from the panel name |
+| `starqelvss=off` | loader + kernel | nothing is sent |
+| `starqelvss=<hex list>` | loader + kernel | replaces the default sequence entirely |
+| `starqmps=cc` | loader only | byte 2 of the default sequence |
+| `starqdsisw=1` | loader only | skip the scan-line scheduling, trigger the DMA immediately (mainline's behaviour) |
+| `starqdsi=0` | kernel only | disable the kernel-side send |
 
 Two places send it, for one reason:
 
 | Where | When | Source |
 | --- | --- | --- |
-| loader (`shim/starqltechn/dsi.c`) | every boot, right before the jump to XNU | `starqelvss=` in the payload cmdline, or `STARQ_ELVSS_DEFAULT` |
-| kernel (patch 0083, `bsd/dev/starqltechn_hw.c`) | after `starqltechn_hw_init()`, i.e. once the scheduler runs | `starqelvss=` in the boot-args |
+| loader (`shim/starqltechn/dsi.c`) | every boot, right before the jump to XNU | `/chosen/bootargs` panel probe + the payload cmdline |
+| kernel (patch 0083, `bsd/dev/starqltechn_hw.c`) | after `starqltechn_hw_init()`, i.e. once the scheduler runs | `/chosen/bootargs` panel probe + the kernel boot-args |
 
 The kernel copy exists because XNU takes minutes to reach the GUI and the panel
 can be power-cycled in between; the loader copy exists because it works even if
-XNU panics before that point. Both do exactly the same write.
+XNU panics before that point. Both compute the same three commands.
 
-Other switches: `starqdsisw=1` (loader only) skips the scan-line scheduling and
-software-triggers the DMA immediately, which is mainline's behaviour; `starqdsi=0`
-(kernel only) disables the kernel-side send.
+`STARQ_ELVSS_DEFAULT` (build-time, `shim/starqltechn/loader.c`) still exists, but
+it is empty by design: it is only for baking one *specific* sequence into an
+image, and a non-empty value there would override the per-panel default.
 
-**Finding the panel's current ELVSS state.** Read DCS `0xB5` back: the vendor
-driver does it with `samsung,elvss_rx_cmds_revA = [06 01 00 00 00 00 01 b5 02 16]`,
-a DCS short read of two parameters. Our code implements **writes only** — the
-read path needs the BTA/rx-buffer handling of the command DMA, which is a
-different register sequence — so use one of:
+**Caveat — this is a per-unit judgement.** Forcing `-15 °C` compensation at room
+temperature is not a calibration, it is a bias: it lowers ELVSS until the tint
+goes away, which can also **crush blacks and clip near-black detail**, and how
+much is acceptable differs panel to panel and unit to unit (the vendor driver
+also drops MPS to `0xcc` below 39 cd precisely to compensate differently at low
+brightness). Nothing here is permanent: the panel resets on the next power
+cycle, so a plain reboot restores the previous state and reflashing is not
+needed. Change one field at a time and keep the previous working string in
+`NOTES.md`.
 
-- on Android, the Magisk module's own log or `/sys/class/lcd/panel/` registers,
-  or `dmesg | grep -i elvss` (the Samsung panel driver logs the tables it picks);
-- once the panel is on the correct table and looks right, the value you sent is
-  by definition the state you want to keep.
-
-For a starting point, the vendor table's neighbours around one entry are
-`b5 19 dc 0a` .. `b5 19 cc 07` (the temperature sweep) — the third and fourth
-bytes are what change. Three bytes in the payload are the panel's business; the
-loader only logs `STARQ DSI: dcs b5 8f dc 0a` and what the DMA engine answered.
-
-**Warning: a wrong `0xB5` is visible.** ELVSS is the panel's black level, so a
-bad TSET/MPS/offset pair leaves the display washed out, too dark, or with a
-coloured black — often worse than the tint you were fixing. It is **not**
-permanent: the panel resets on the next power cycle, so a plain reboot restores
-the previous state, and reflashing is not needed. Change one field at a time and
-keep the previous working string in `NOTES.md`.
+**No DCS read.** The read path would need the BTA/rx-buffer handling of the
+command DMA plus three paginated passes (only 2 bytes are exposed at a time),
+which is not worth the risk on an unproven link. A DCS `0xD6` read after a
+`0xB0` page select is the vendor's own mechanism and the future path if reading
+the current state ever becomes necessary.
 
 Both paths log every byte and every DMA poll as `STARQ DSI:` lines, on the panel
 and in both ramoops zones, so a failed attempt is readable afterwards with
 `tools/starq-flash.sh pull-log` even when the panel looks black:
 
 ```
-STARQ DSI: ctrl=0xae94000 phy=0xae94400 buf=0x9f7ff000
-STARQ DSI: hwver=... ctrl=0x... status=0x0
-STARQ DSI: mode=video cmd_en=0 ena=0x1 lanes=0xf
-STARQ DSI: vid=0x... active_v=0xc5c0080 total=0x...
+STARQ DSI: panel=PX01 name=ss_dsi_panel_S6E3HA8_AMB577PX01_WQHD:config0
+STARQ DSI: DSI_CTRL=0x000001b3 en=1 video=1 cmd=0 hwver=0x00000001 status=0x0 lanes=0xb
+STARQ DSI: ack_err=0x00000000 timeout=0x00000000
+STARQ DSI: panel in VIDEO mode: the bootloader framebuffer is being scanned out
+STARQ DSI: default policy, panel=PX01 mps=0xdc elvss=0x16
 STARQ DSI: sched line=3164
-STARQ DSI: dcs b5 8f dc 0a pkt=0x8
+STARQ DSI: dcs b5 8f dc 16 pkt=0x8
 STARQ DSI: command sent
 ```
+
+### **Read this before trusting the framebuffer path: both S9 panels are command mode**
+
+The vendor DTS declares *both* S9 panels `dsi_cmd_mode`:
+`dtsi_px01.dtsi:70` and `dtsi_mq01.dtsi:66` (`qcom,mdss-dsi-panel-type =
+"dsi_cmd_mode"`). An earlier version of this document and of `NOTES.md`
+assumed video mode. If the panel really is in command mode it has its own GRAM,
+and **writing pixels into the bootloader framebuffer at `0x9d400000` will not
+appear on screen at all** — MDSS `write_memory_start` plus a full DSI bring-up
+becomes mandatory rather than optional.
+
+The runtime register decides, not the DT, so the loader reports it. The line to
+look for in `tools/starq-flash.sh pull-log` is
+
+```
+STARQ DSI: DSI_CTRL=0x000001b3 en=1 video=1 cmd=0 ...
+STARQ DSI: panel in VIDEO mode: the bootloader framebuffer is being scanned out
+```
+
+`video=1` means the bootloader framebuffer path works and the CPU-copy
+display plan applies. `cmd=1` with `video=0` means it does not:
+
+```
+STARQ DSI: panel in COMMAND mode (vendor DT agrees, dsi_cmd_mode): FB_BASE is NOT on screen unless MDSS push/write_memory_start is programmed
+```
+
+`en=0` means the link is down entirely (DSI_CTRL.ENABLE clear); the loader then
+sends nothing, logs `LINK DOWN (DSI_CTRL.ENABLE=0)` and XNU still starts. The
+same line also prints `DSI_ACK_ERR_STATUS` and `DSI_TIMEOUT_STATUS`, so a link
+that is up but erroring shows it.
 
 ### pstore logging
 

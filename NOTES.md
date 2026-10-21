@@ -31,12 +31,51 @@ port is unaffected.
   `loader.c`, `build.sh`, `host_test.c`, `Makefile`) - the S8-proven validation
   chain, XNU-RAM zeroing, dual-zone ramoops logging, and the framebuffer test
   pattern that decides the display work.
-- 2026-10-21 (this session) DSI DCS transmit for the panel ELVSS override:
+- `7536e7d` + `85e34aa` DSI DCS transmit for the panel ELVSS override:
   `shim/starqltechn/dsi.{c,h}` (DSI0 command DMA, read-only register snapshot,
-  `starqelvss=` hex-list parser), wired into `loader.c` after the framebuffer
-  pattern, and `xnu/patches/0083-starq-dsi-elvss.patch` for the same write from
-  the kernel. Details and the boot-arg syntax are in
-  `tools/README-starqltechn.md`, "Panel ELVSS override over DSI".
+  `starqelvss=` hex-list parser), wired into `loader.c`, and
+  `xnu/patches/0083-starq-dsi-elvss.patch` for the same write from the kernel.
+- 2026-10-21 (later) **revised** by the corrected vendor-driver study below:
+  the override is now **on by default and panel-aware**, reads the panel name
+  from the **DTB's `/chosen/bootargs`**, sends a 4-byte `b5 8f dc <elvss>`
+  wrapped in the level-1 key, and the loader prints `DSI_CTRL`'s
+  enable/video/cmd bits. Details in `README-starqltechn.md`, "Panel ELVSS
+  override over DSI" and "Read this before trusting the framebuffer path".
+
+**Corrected display facts (2026-10-21, from the Samsung vendor driver).** These
+supersede what the first ELVSS commit and the earlier display notes said:
+
+1. **`0xB5` is not readable as a full payload.** Both panels expose a **2-byte**
+   read at a `0xB0`-selected offset (`samsung,elvss_rx_cmds_revA =
+   [06 01 00 00 00 00 01 B5 02 16]` PX01 / `... 02 17` MQ01, `rx_len=2`,
+   `dsi_panel.c:2113-2114`). No read-modify-write of the page; no DCS read.
+2. **A 4-byte partial `0xB5` write is the right universal move.** MQ01 writes
+   `0xB5` natively as 4 bytes (`b5 19 dc 0a`, 26 entries,
+   `dtsi_mq01.dtsi:2648-2676`). PX01's 24-byte form is only ever *changed* in
+   bytes 1, 2, 3 and 23 (`p_px01.c:863-889`), and byte 23 is a per-panel OTP
+   black-level trim that must be **preserved, not synthesised**. A 4-byte write
+   leaves PX01's bytes 4..23 untouched.
+3. **Byte 3 differs per panel:** PX01 index-0 is `b5 19 dc 16`, MQ01 is
+   `b5 19 dc 0a`. The Magisk module only forces TSET `0x19`/`0x14` -> **`0x8F`**
+   (`BIT(7)|15` = -15 C); MPS stays `0xDC` above 39 cd. Command:
+   `f0 5a 5a` / `b5 8f dc <0x16|0x0a>` / `f0 a5 a5` (`0xB5` is level-1
+   protected: PX01's own gray-spot test wraps it in `F0 5A 5A`/`F0 A5 A5`,
+   `dtsi_px01.dtsi:1905-1919`, and `ss_elvss()` sets `*level_key = LEVEL1_KEY`).
+4. **Panel identity comes from the bootloader cmdline**, free of risk:
+   `msm_drm.dsi_display0=<panel node>:config0` lives in the **DTB's
+   `/chosen/bootargs`** (`dsi_display.c:7061-7064`, matched against
+   `panel->name` in `ss_dsi_panel_common.c:4862-4876`). `AMB577PX01` -> PX01,
+   `AMB577MQ01` -> MQ01, neither -> UNKNOWN (sends the PX01 value: PX01 is the
+   higher-volume starqlte panel and `0x16` is the more compensated of the two,
+   so a wrong guess errs towards less green).
+5. **Both S9 panels are `dsi_cmd_mode`** in the vendor DTS
+   (`dtsi_mq01.dtsi:66`, `dtsi_px01.dtsi:70`) - **not** video mode, which is
+   what this file and the README previously assumed. This is the single most
+   important fact for the display plan: a command-mode panel has its own GRAM,
+   so writing the bootloader framebuffer at `0x9d400000` may not appear on
+   screen at all and MDSS `write_memory_start` becomes mandatory. The runtime
+   `DSI_CTRL` register decides; the loader now prints it. **Not yet verified on
+   hardware** - it is the first thing to read in the next `pull-log`.
 
 **The two regressions, and why they generalise to any new board.** Both came from
 adding a second machine config to a tree that had only ever had one; neither was
