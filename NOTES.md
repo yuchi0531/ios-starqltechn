@@ -2,6 +2,31 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-21: 0082 SWEET-macro link regression FIXED (commit bab67f6, CI not run yet) <<<
+
+CI run **39577311640** (`MACHINE_CONFIG=SWEET`, macos-14) failed at LINK with undefined
+`_br_sha384_init/_out/_update`, `_br_sha512_init/_out` (corecrypto_sha2.o),
+`_sweet_amfi_policy_register` (bsd_init.o), `_sweet_log_append` (serial_console.o),
+`_sweet_log_copy/_position` (sweet_usb.o), `_sweet_rpmh_vreg_enable` (sweet_touch.o),
+`_sweet_ufs_rootdev` (IOKitBSDInit.cpo).
+
+Cause: 0082 rewrote ~41 files from `#if defined(ARM64_BOARD_CONFIG_SWEET)` to
+`#if defined(SWEET)`, but `SWEET` is only `#define`d in
+`pexpert/pexpert/arm64/SWEET.h`, which 28 of those files do not include before their
+gate -> in a SWEET build every gated file compiled to nothing. 0082 added `-DSWEET`
+to the new `MACHINE_FLAGS_ARM64_STARQLTECHN` but not to `MACHINE_FLAGS_ARM64_SWEET`.
+
+Fix (0082 edited in place, no new patch): `MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET -DSWEET -march=armv8.2-a+crypto`;
+comment adapted to cover both Qualcomm configs; STARQLTECHN line unchanged. The patch
+hunk header was also wrong (`-62,6 +62,10`) and is now correct.
+
+Verified offline against a real **xnu-8796.141.3** tree (the version 0026-stage-hfs.sh
+requires, not .121.2): all 82 patches + the three staging `.sh` apply cleanly with both
+`git apply -p1` and `patch -p1`, producing both `-DSWEET` flags. `tools/validate-repo.py`
+passes. `SWEET.h` has include guards and `#ifndef SWEET` around `#define SWEET 1`, so the
+flag is harmless (gcc `-Wall -Wextra -pedantic` on both configs: no warning).
+No file needs an extra `SWEET.h` include. Next: orchestrator pushes -> CI.
+
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
 **STATE at end of 2026-10-18 (evening):**
