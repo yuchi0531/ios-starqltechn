@@ -2,7 +2,42 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
-### >>> UPDATE 2026-10-21: 0082 SWEET-macro link regression FIXED (commit bab67f6, CI not run yet) <<<
+### >>> UPDATE 2026-10-21: starqltechn staging + pid_hibernate FIXED (commit 6c1f4e6, CI not run) <<<
+
+CI run **39581943003** (`MACHINE_CONFIG=STARQLTECHN`) failed with 22 "file not found"
+errors for the third-party trees plus one type error. Three independent causes:
+
+1. `0019-stage-libpthread.sh`, `0020-stage-bearssl.sh`, `0026-stage-hfs.sh` each began
+   with `[[ "${MACHINE_CONFIG:-}" == SWEET ]] || exit 0`, so under STARQLTECHN they
+   exited before fetching, while 0082 makes that configuration compile
+   `bsd/pthread/sweet_pthread_*.c`, `libkern/crypto/sweet_*.c` and `bsd/sweet_hfs/*`.
+   All three now use `case "${MACHINE_CONFIG:-}" in SWEET|STARQLTECHN) ;; *) exit 0 ;; esac`;
+   the `MACOS_VERSION == 13.5` check and its message stay (wording now
+   "SWEET/STARQLTECHN ..."). Nothing else in the scripts changed.
+2. `bsd/sweet_hfs/sweet_hfs_compat.h:22: 'core/kext-config.h' file not found` was the
+   same cause, not an include-path problem: 0026 had not run, so `bsd/sweet_hfs/core/`
+   did not exist at all (the compiler line in the CI log already carried
+   `-include .../sweet_hfs_compat.h -I.../sweet_hfs -I.../sweet_hfs/core`, i.e. the
+   `ifneq ($(filter $(CURRENT_MACHINE_CONFIG),SWEET STARQLTECHN),)` block from 0082 was
+   active). Confirmed from the run log: `make[7]: *** No rule to make target
+   .../bsd/sweet_hfs/core/BTree.c`.
+3. `bsd/vm/vm_unix.c:1774: incomplete definition of type 'struct pid_hibernate_args'`:
+   0082 rewrote the vm_unix.c guard to `defined(SWEET)` but not the one in
+   `bsd/kern/syscalls.master`, which 0070 had set to
+   `#if CONFIG_EMBEDDED || defined(ARM64_BOARD_CONFIG_SWEET)`. That file generates
+   `sysproto.h`, so STARQLTECHN (`-DARM64_BOARD_CONFIG_STARQLTECHN -DSWEET`, no
+   CONFIG_EMBEDDED) got no struct declaration and `nosys` for syscall 435. 0082 now
+   has a hunk widening it to `defined(SWEET)`.
+
+Verified offline on a real xnu-8796.141.3 + all 82 patches, for both
+`MACHINE_CONFIG=SWEET` and `STARQLTECHN`: three scripts stage, no patch is skipped
+(`git apply` and `patch -p1`), every staged include resolves, every `bsd/conf/files`
+sweet_hfs entry exists, all 40 sweet_hfs objects get the compat `-include`, and the
+generated `sysproto.h`/`init_sysent.c` carry `pid_hibernate` for
+`-DARM64_BOARD_CONFIG_STARQLTECHN -DSWEET`. `tools/validate-repo.py` passes.
+Next: push -> rerun CI for STARQLTECHN.
+
+### >>> UPDATE 2026-10-21: 0082 SWEET-macro link regression FIXED (commit bab67f6, CI run 39581943003 SWEET path) <<<
 
 CI run **39577311640** (`MACHINE_CONFIG=SWEET`, macos-14) failed at LINK with undefined
 `_br_sha384_init/_out/_update`, `_br_sha512_init/_out` (corecrypto_sha2.o),
