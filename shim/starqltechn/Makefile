@@ -10,9 +10,9 @@ CFLAGS ?= -O1 -g -Wall -Wextra -Werror -I..
 all: out/starq_host_test
 	./out/starq_host_test
 
-out/starq_host_test: host_test.c loader.c ../fdt.c loader.h
+out/starq_host_test: host_test.c loader.c dsi.c ../fdt.c loader.h dsi.h
 	@mkdir -p out
-	$(CC) $(CFLAGS) -o $@ host_test.c loader.c ../fdt.c
+	$(CC) $(CFLAGS) -o $@ host_test.c loader.c dsi.c ../fdt.c
 
 clean:
 	rm -rf out

@@ -37,7 +37,7 @@ CFLAGS="$CFLAGS ${CFLAGS_EXTRA:-}"
 
 mkdir -p "$OUT"
 objs=""
-for f in start.S loader.c ../fdt.c; do
+for f in start.S loader.c dsi.c ../fdt.c; do
 	o="$OUT/starq-$(basename "${f%.*}").o"
 	$CC $CFLAGS -c "$here/$f" -o "$o"
 	objs="$objs $o"

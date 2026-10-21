@@ -24,6 +24,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/mman.h>
+#include "dsi.h"
 #include "loader.h"
 
 /* Addresses the loader uses. Kept here only so the test can map them; the
@@ -41,6 +42,14 @@
 #define T_RD_SIZE	0x200000UL
 #define T_XNU_WIN	0x200000UL			/* payload mem_size: small, so
 							 * zeroing it in the test is cheap */
+
+/* DSI0: the test gives the driver a register file instead of the real
+ * addresses (dsi.c's MMIO ops compile to array accesses on the host, the same
+ * trick the loader uses for the framebuffer). The values are the vendor DT's,
+ * so the test also proves the driver is pointed at the right blocks. */
+#define T_DSI_CTRL	0xae94000UL
+#define T_DSI_PHY	0xae94400UL
+#define T_DSI_BUF	((uintptr_t)starq_dsi_cmd_buf)
 
 #define FB_PIX		((volatile uint32_t *)T_FB_BASE)
 #define FB_LINE		(1440)
@@ -347,6 +356,263 @@ int main(void)
 		check(len <= 0x40000 - 12, "log fits the zone (%u)", len);
 		/* the ftrace zone at 0xa13c0000 must be untouched */
 		check(*(volatile uint32_t *)(0xa13c0000UL) == 0, "ftrace zone untouched");
+	}
+
+	printf("== DSI DCS over the command path\n");
+	{
+		/* Register state a booting S-Boot leaves: video engine streaming,
+		 * active_v end = v_sync_width + v_back_porch + v_active = 0x0b90
+		 * (0x50 + 0x7c + 0xb90 = 0xc5c... the panel's own numbers are
+		 * 2960 + 124 + 80 = 3164 = 0xc5c). Whatever the value, the driver
+		 * must schedule the DMA on ACTIVE_V[31:16] and never invent one. */
+		memset(starq_dsi_regs_ctrl, 0, sizeof(starq_dsi_regs_ctrl));
+		memset(starq_dsi_regs_phy, 0, sizeof(starq_dsi_regs_phy));
+		starq_dsi_regs_ctrl[0x004 / 4] = 0x000001b3u; /* ena|vid|cmd|clk|lane0-3 */
+		starq_dsi_regs_ctrl[0x008 / 4] = 0x00000000u; /* idle */
+		starq_dsi_regs_ctrl[0x028 / 4] = 0x0c5c0080u; /* active_v start/end */
+		starq_dsi_regs_phy[0x0ec / 4] = 0x00000001u; /* refgen ready */
+
+		check(starq_dsi_init(T_DSI_CTRL, T_DSI_PHY) == 0, "init maps both blocks");
+		check(starq_dsi_regs_phy[0x0ec / 4] == 1, "PHY snapshot did not write it");
+
+		/* --- parsing: one command --- */
+		struct starq_dcs_seq s;
+		check(starq_dcs_parse("b5,8f,dc,0a", &s) == 0 && s.n == 1 &&
+		      s.cmd[0].len == 4 && s.cmd[0].data[0] == 0xb5 &&
+		      s.cmd[0].data[1] == 0x8f && s.cmd[0].data[2] == 0xdc &&
+		      s.cmd[0].data[3] == 0x0a,
+		      "b5,8f,dc,0a -> one 4-byte command");
+
+		/* --- parsing: ';' separated, level-1 key unlock first --- */
+		check(starq_dcs_parse("f0,5a,5a;b5,8f,dc,0a", &s) == 0 && s.n == 2 &&
+		      s.cmd[0].len == 3 && s.cmd[0].data[0] == 0xf0 &&
+		      s.cmd[0].data[2] == 0x5a && s.cmd[1].len == 4 &&
+		      s.cmd[1].data[0] == 0xb5 && s.cmd[1].data[3] == 0x0a,
+		      "f0,5a,5a;b5,8f,dc,0a -> two commands");
+		check(starq_dcs_parse("b5,8f", &s) == 0 && s.n == 1 && s.cmd[0].len == 2,
+		      "two bytes parse (short write with parameter)");
+		check(starq_dcs_parse("29", &s) == 0 && s.n == 1 && s.cmd[0].len == 1,
+		      "one byte parses (short write)");
+		check(starq_dcs_parse("B5,8F,DC,0A", &s) == 0 && s.cmd[0].data[0] == 0xb5,
+		      "uppercase hex accepted");
+		check(starq_dcs_parse("0,b5", &s) == 0 && s.cmd[0].data[0] == 0 &&
+		      s.cmd[0].data[1] == 0xb5, "0 is a byte, not an empty field");
+
+		/* --- parsing: malformed input is rejected whole --- */
+		check(starq_dcs_parse("", &s) != 0 && s.n == 0, "empty string rejected");
+		check(starq_dcs_parse("b5,8f,dc,0a;", &s) != 0 && s.n == 0,
+		      "trailing ';' rejected");
+		check(starq_dcs_parse("b5,,dc", &s) != 0 && s.n == 0,
+		      "empty byte rejected");
+		check(starq_dcs_parse("b5,8f,dc,0a,", &s) != 0 && s.n == 0,
+		      "trailing ',' rejected");
+		check(starq_dcs_parse("b5,zz", &s) != 0 && s.n == 0,
+		      "non-hex digit rejected");
+		check(starq_dcs_parse("b5 8f", &s) != 0 && s.n == 0,
+		      "space rejected (the boot-arg would split it anyway)");
+		check(starq_dcs_parse("b5,8fdc,0a", &s) != 0 && s.n == 0,
+		      "3 hex digits in a field rejected");
+		check(starq_dcs_parse(";", &s) != 0 && s.n == 0, "bare ';' rejected");
+		check(starq_dcs_parse("b5,8f;", &s) != 0 && s.n == 0,
+		      "malformed second command clears a valid first one");
+
+		/* --- no boot-arg: nothing is sent --- */
+		starq_dsi_trace_n = 0;
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		entry = boot_ok("starqfb=0");
+		check(entry != 0, "booted with no starqelvss");
+		check(starq_dsi_trace_n == 0, "no DSI write without the boot-arg (%u)",
+		      starq_dsi_trace_n);
+		{
+			/* No boot-arg means no register access at all: a read of an
+			 * unclocked MDSS block can hang the interconnect, and that
+			 * costs an Odin flash. The log says so instead. */
+			const char *t = (const char *)0xa134000cUL;
+			uint32_t len = *(volatile uint32_t *)(0xa1340008UL);
+			check(memmem(t, len, "DSI0 left alone", 15) != NULL,
+			      "no boot-arg leaves DSI0 untouched");
+			check(memmem(t, len, "STARQ DSI: ctrl=", 16) == NULL,
+			      "and does not even snapshot the registers");
+		}
+
+		/* --- starqelvss= sends the sequence, in order, via DMA --- */
+		starq_dsi_trace_n = 0;
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		check(boot_ok("starqfb=0 starqelvss=b5,8f,dc,0a") != 0, "booted");
+		{
+			unsigned mem_off = 0, trig = 0, sched = 0;
+			for (unsigned i = 0; i < starq_dsi_trace_n; i++) {
+				uint32_t o = starq_dsi_trace[i].off;
+				if (o == 0x048) mem_off = starq_dsi_trace[i].val;
+				if (o == 0x090) trig = starq_dsi_trace[i].val;
+				if (o == 0x100) sched = starq_dsi_trace[i].val;
+			}
+			check(mem_off == (uint32_t)(uintptr_t)T_DSI_BUF,
+			      "DMA offset is the packet buffer (%#x)", mem_off);
+			check(trig == 1, "software trigger issued");
+			check(sched == 0, "schedule cleared again afterwards");
+			/* the packet: WC=4, DT=0x39, last|long, then the payload */
+			check(starq_dsi_cmd_buf[0] == 4 && starq_dsi_cmd_buf[1] == 0 &&
+			      starq_dsi_cmd_buf[2] == 0x39 &&
+			      starq_dsi_cmd_buf[3] == (0x80 | 0x40) &&
+			      starq_dsi_cmd_buf[4] == 0xb5 && starq_dsi_cmd_buf[5] == 0x8f &&
+			      starq_dsi_cmd_buf[6] == 0xdc && starq_dsi_cmd_buf[7] == 0x0a,
+			      "long-write packet: 4 0 39 c0 b5 8f dc 0a");
+			const char *t = (const char *)0xa134000cUL;
+			uint32_t len = *(volatile uint32_t *)(0xa1340008UL);
+			check(memmem(t, len, "STARQ DSI: dcs b5 8f dc 0a", 26) != NULL,
+			      "every byte logged");
+			check(memmem(t, len, "STARQ DSI: command sent", 23) != NULL,
+			      "completion logged");
+			check(memmem(t, len, "sched line=0xc5c", 16) != NULL,
+			      "DMA scheduled on the ACTIVE_V blanking line");
+			check(memmem(t, len, "mode=video", 10) != NULL,
+			      "video mode recognised from DSI_CTRL");
+		}
+
+		/* --- one byte becomes a short write --- */
+		starq_dsi_trace_n = 0;
+		check(boot_ok("starqelvss=29") != 0, "booted");
+		check(starq_dsi_cmd_buf[0] == 0x29 && starq_dsi_cmd_buf[1] == 0 &&
+		      starq_dsi_cmd_buf[2] == 0x05 && starq_dsi_cmd_buf[3] == 0x80,
+		      "1-byte DCS write -> short write packet 29 00 05 80");
+
+		/* --- two commands, both sent, in order --- */
+		starq_dsi_trace_n = 0;
+		check(boot_ok("starqelvss=f0,5a,5a;b5,8f,dc,0a") != 0, "booted");
+		{
+			unsigned trig = 0;
+			for (unsigned i = 0; i < starq_dsi_trace_n; i++)
+				if (starq_dsi_trace[i].off == 0x090 && starq_dsi_trace[i].val == 1)
+					trig++;
+			check(trig == 2, "two triggers for two commands (%u)", trig);
+			/* the second command's packet is what remains in the buffer */
+			check(starq_dsi_cmd_buf[4] == 0xb5, "second packet is b5 ...");
+		}
+
+		/* --- malformed: rejected, and nothing reaches the wire --- */
+		starq_dsi_trace_n = 0;
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		check(boot_ok("starqelvss=b5,zz") != 0, "boot still succeeds");
+		{
+			unsigned trig = 0;
+			for (unsigned i = 0; i < starq_dsi_trace_n; i++)
+				if (starq_dsi_trace[i].off == 0x090)
+					trig++;
+			check(trig == 0, "malformed list sends nothing (%u triggers)", trig);
+			const char *t = (const char *)0xa134000cUL;
+			uint32_t len = *(volatile uint32_t *)(0xa1340008UL);
+			check(memmem(t, len, "nothing sent", 12) != NULL,
+			      "malformed list is logged, not silently dropped");
+		}
+
+		/* --- the memory path times out: FIFO fallback carries it --- */
+		starq_dsi_sim_stall = 1;	/* memory path never completes */
+		starq_dsi_trace_n = 0;
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		check(boot_ok("starqelvss=b5,8f,dc,0a") != 0, "booted");
+		starq_dsi_sim_stall = 0;
+		{
+			unsigned fifo = 0;
+			for (unsigned i = 0; i < starq_dsi_trace_n; i++)
+				if (starq_dsi_trace[i].off == 0x15c &&
+				    starq_dsi_trace[i].val == ((1u << 1) | (1u << 2) | (3u << 16)))
+					fifo = 1;
+			check(fifo, "FIFO path used after the memory timeout");
+			const char *t = (const char *)0xa134000cUL;
+			uint32_t len = *(volatile uint32_t *)(0xa1340008UL);
+			check(memmem(t, len, "DMA done timeout", 16) != NULL,
+			      "timeout logged, not a hang");
+			check(memmem(t, len, "FIFO fallback", 13) != NULL,
+			      "fallback logged");
+			check(memmem(t, len, "STARQ DSI: command sent", 23) != NULL,
+			      "command still delivered");
+		}
+
+		/* --- both paths stall: an error, never a hang --- */
+		starq_dsi_sim_stall = 3;
+		starq_dsi_trace_n = 0;
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		check(boot_ok("starqelvss=b5,8f,dc,0a") != 0, "booted");
+		starq_dsi_sim_stall = 0;
+		{
+			const char *t = (const char *)0xa134000cUL;
+			uint32_t len = *(volatile uint32_t *)(0xa1340008UL);
+			check(memmem(t, len, "command FAILED", 14) != NULL,
+			      "both paths timing out is an error");
+			check(memmem(t, len, "override not applied", 20) != NULL,
+			      "loader reports the override did not take");
+			/* and XNU is still started: the panel is not worth a hang */
+			check(memmem(t, len, "JUMP TO XNU", 11) != NULL,
+			      "boot continues after a failed DCS write");
+		}
+
+		/* --- nothing outside the command path is written --- */
+		{
+			/* Video timing, PHY and clock registers, as a fresh boot
+			 * leaves them; a transfer must leave every one alone. */
+			static const uint32_t ro_ctrl[] = { 0x008, 0x00c, 0x010, 0x014,
+				0x018, 0x01c, 0x024, 0x028, 0x02c, 0x030, 0x034,
+				0x038, 0x084, 0x0a8, 0x0ac, 0x0b0, 0x11c, 0x120 };
+			static const uint32_t ro_phy[] = { 0x010, 0x014, 0x018, 0x01c,
+				0x020, 0x024, 0x030, 0x038, 0x0ac, 0x0b0, 0x0ec,
+				0x0f4, 0x0f8 };
+			uint32_t snap_ctrl[sizeof(ro_ctrl) / 4], snap_phy[sizeof(ro_phy) / 4];
+			unsigned before = 0, bad = 0;
+
+			memset(starq_dsi_regs_ctrl, 0xa5, sizeof(starq_dsi_regs_ctrl));
+			memset(starq_dsi_regs_phy, 0x5a, sizeof(starq_dsi_regs_phy));
+			/* a plausible live link */
+			starq_dsi_regs_ctrl[0x004 / 4] = 0x000001b3u;
+			starq_dsi_regs_ctrl[0x008 / 4] = 0x00000000u; /* idle */
+			starq_dsi_regs_ctrl[0x028 / 4] = 0x0c5c0080u;
+			starq_dsi_regs_ctrl[0x110 / 4] = 0x02000000u; /* error mask bit */
+			starq_dsi_regs_phy[0x0ec / 4] = 1;
+			for (unsigned i = 0; i < sizeof(ro_ctrl) / 4; i++)
+				snap_ctrl[i] = starq_dsi_regs_ctrl[ro_ctrl[i] / 4];
+			for (unsigned i = 0; i < sizeof(ro_phy) / 4; i++)
+				snap_phy[i] = starq_dsi_regs_phy[ro_phy[i] / 4];
+
+			before = starq_dsi_trace_n;
+			check(starq_dsi_dcs_write((const uint8_t *)"b5\x8f\xdc\x0a", 4) == 0,
+			      "write succeeds against the live-link register file");
+			for (unsigned i = 0; i < sizeof(ro_ctrl) / 4; i++)
+				if (starq_dsi_regs_ctrl[ro_ctrl[i] / 4] != snap_ctrl[i]) {
+					bad++;
+					printf("      ctrl %#x: %#x -> %#x\n", ro_ctrl[i],
+					       snap_ctrl[i], starq_dsi_regs_ctrl[ro_ctrl[i] / 4]);
+				}
+			for (unsigned i = 0; i < sizeof(ro_phy) / 4; i++)
+				if (starq_dsi_regs_phy[ro_phy[i] / 4] != snap_phy[i]) {
+					bad++;
+					printf("      phy %#x: %#x -> %#x\n", ro_phy[i],
+					       snap_phy[i], starq_dsi_regs_phy[ro_phy[i] / 4]);
+				}
+			check(bad == 0, "no video-timing, PHY or clock register written");
+			check(starq_dsi_trace_n > before, "the transfer did write something");
+		}
+
+		/* --- starqdsisw=1: no schedule, plain software trigger --- */
+		starq_dsi_trace_n = 0;
+		check(boot_ok("starqdsisw=1 starqelvss=b5,8f,dc,0a") != 0, "booted");
+		{
+			unsigned sched = 0;
+			for (unsigned i = 0; i < starq_dsi_trace_n; i++)
+				if (starq_dsi_trace[i].off == 0x100)
+					sched++;
+			check(sched == 0, "starqdsisw=1 leaves DSI_DMA_SCHEDULE_CTRL alone");
+		}
+
+		/* --- a lookalike boot-arg must not match --- */
+		starq_dsi_trace_n = 0;
+		check(boot_ok("nostarqelvss=b5,8f,dc,0a") != 0, "booted");
+		{
+			unsigned trig = 0;
+			for (unsigned i = 0; i < starq_dsi_trace_n; i++)
+				if (starq_dsi_trace[i].off == 0x090)
+					trig++;
+			check(trig == 0, "nostarqelvss= sends nothing");
+		}
 	}
 
 	printf(failures ? "\n%d FAILURE(S)\n" : "\nall checks passed\n", failures);

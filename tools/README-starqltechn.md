@@ -278,6 +278,7 @@ is untouched and still produces the same `mkbootimg` command line.
 | `start.S` | arm64 Linux Image header + entry. EL1, MMU and caches off, `x0` = DTB (S-Boot's contract). Position independent; passes its own run-time load address to C so the loader can tell whether zeroing XNU's RAM would erase itself. |
 | `loader.ld` | Linked at 0, 32 KiB stack after `.bss`, no secondary stacks. |
 | `loader.c` | The S-Boot-specific loader (see below). |
+| `dsi.c` | DSI0 command-DMA transmit (`starq_dsi_dcs_write`), the `starqelvss=` hex-list parser and the read-only register snapshot. See "Panel ELVSS override over DSI" above. |
 | `build.sh` | Compile + optional pack. `build.sh STOCK_BOOT.img PAYLOAD.bin OUT.img [DTBH.bin]`, packed by `tools/starq_mkboot.py`, so `mkbootimg` is not needed. |
 | `Makefile` | `make -C shim/starqltechn` builds and runs the host test. |
 
@@ -334,6 +335,104 @@ Turn it off with `STARQ_FB_TEST=0` at build time
 `starqfb=0` on the boot-args (which `tools/starq-boot.sh` passes to
 `mkpayload.py --cmdline`). `starqfb=1` forces it back on. Either way the loader
 logs `fb pattern ON`/`OFF`.
+
+### Panel ELVSS override over DSI (`starqelvss=`)
+
+This panel's green tint is an ELVSS (black-level) calibration problem, not a
+gamma or a framebuffer one. On Android a Magisk module fixes it by rewriting the
+panel's ELVSS temperature compensation to the extreme-cold table; the vendor
+driver's own command list is `samsung,elvss_tx_cmds_revA` in
+`ss_dsi_panel_S6E3HA8_AMB577PX01_WQHD` (`sdm845-sec-starqlte` DTSI):
+
+```
+29 01 00 00 00 00 04 b5 19 dc 0a   ->   DCS 0xB5 with TSET=0x19 MPS=0xdc ELVSS=0x0a
+```
+
+i.e. **one DSI long write of four bytes: `0xB5`, TSET (temperature), MPS,
+ELVSS offset.** S-Boot leaves MDSS + DSI0 + the panel powered and streaming, so
+the loader can send that packet over the DSI command DMA without any display
+driver, and a wrong value is undone by the next reboot (the panel resets).
+
+**The bytes are yours to choose** — the port computes nothing. Pass them on the
+boot-args, which `tools/starq-boot.sh` already forwards to XNU:
+
+```sh
+# one command
+tools/starq-boot.sh --cmdline "starqelvss=b5,8f,dc,0a" ...
+# level-1 key unlock first, then the ELVSS write
+tools/starq-boot.sh --cmdline "starqelvss=f0,5a,5a;b5,8f,dc,0a" ...
+# several writes, applied left to right
+--cmdline "starqelvss=f0,5a,5a;b5,8f,dc,0a;b5,8f,cc,0c"
+```
+
+Syntax: bytes are one or two hex digits, `,` separates the bytes of one command,
+`;` separates commands, up to 8 commands of 64 bytes. Nothing else is accepted:
+an empty byte (`b5,,dc`), a trailing `,` or `;`, a three-digit field or a space
+makes the whole string invalid and **nothing at all is sent** (the log says
+`bad hex list ... nothing sent`). There is no partial application.
+
+Default: **nothing is sent, and DSI0 is not even read.** No boot-arg means the
+loader does not touch the display block at all: a register read of an unclocked
+MDSS can hang Qualcomm's interconnect, and that would cost an Odin flash, so the
+read-only snapshot only happens when a transfer is actually about to be
+attempted. A compiled-in default exists but is empty (`STARQ_ELVSS_DEFAULT` in
+`shim/starqltechn/loader.c`); to bake values into an image:
+
+```sh
+CFLAGS_EXTRA='-DSTARQ_ELVSS_DEFAULT="b5,8f,dc,0a"' BOARD=starqltechn shim/build.sh ...
+```
+
+Two places send it, for one reason:
+
+| Where | When | Source |
+| --- | --- | --- |
+| loader (`shim/starqltechn/dsi.c`) | every boot, right before the jump to XNU | `starqelvss=` in the payload cmdline, or `STARQ_ELVSS_DEFAULT` |
+| kernel (patch 0083, `bsd/dev/starqltechn_hw.c`) | after `starqltechn_hw_init()`, i.e. once the scheduler runs | `starqelvss=` in the boot-args |
+
+The kernel copy exists because XNU takes minutes to reach the GUI and the panel
+can be power-cycled in between; the loader copy exists because it works even if
+XNU panics before that point. Both do exactly the same write.
+
+Other switches: `starqdsisw=1` (loader only) skips the scan-line scheduling and
+software-triggers the DMA immediately, which is mainline's behaviour; `starqdsi=0`
+(kernel only) disables the kernel-side send.
+
+**Finding the panel's current ELVSS state.** Read DCS `0xB5` back: the vendor
+driver does it with `samsung,elvss_rx_cmds_revA = [06 01 00 00 00 00 01 b5 02 16]`,
+a DCS short read of two parameters. Our code implements **writes only** — the
+read path needs the BTA/rx-buffer handling of the command DMA, which is a
+different register sequence — so use one of:
+
+- on Android, the Magisk module's own log or `/sys/class/lcd/panel/` registers,
+  or `dmesg | grep -i elvss` (the Samsung panel driver logs the tables it picks);
+- once the panel is on the correct table and looks right, the value you sent is
+  by definition the state you want to keep.
+
+For a starting point, the vendor table's neighbours around one entry are
+`b5 19 dc 0a` .. `b5 19 cc 07` (the temperature sweep) — the third and fourth
+bytes are what change. Three bytes in the payload are the panel's business; the
+loader only logs `STARQ DSI: dcs b5 8f dc 0a` and what the DMA engine answered.
+
+**Warning: a wrong `0xB5` is visible.** ELVSS is the panel's black level, so a
+bad TSET/MPS/offset pair leaves the display washed out, too dark, or with a
+coloured black — often worse than the tint you were fixing. It is **not**
+permanent: the panel resets on the next power cycle, so a plain reboot restores
+the previous state, and reflashing is not needed. Change one field at a time and
+keep the previous working string in `NOTES.md`.
+
+Both paths log every byte and every DMA poll as `STARQ DSI:` lines, on the panel
+and in both ramoops zones, so a failed attempt is readable afterwards with
+`tools/starq-flash.sh pull-log` even when the panel looks black:
+
+```
+STARQ DSI: ctrl=0xae94000 phy=0xae94400 buf=0x9f7ff000
+STARQ DSI: hwver=... ctrl=0x... status=0x0
+STARQ DSI: mode=video cmd_en=0 ena=0x1 lanes=0xf
+STARQ DSI: vid=0x... active_v=0xc5c0080 total=0x...
+STARQ DSI: sched line=3164
+STARQ DSI: dcs b5 8f dc 0a pkt=0x8
+STARQ DSI: command sent
+```
 
 ### pstore logging
 

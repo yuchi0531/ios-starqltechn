@@ -40,3 +40,13 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr,
 		 uintptr_t load, uint64_t len);
 /* boot_args PA for start.S to pass in x0 */
 extern uint64_t starq_boot_args;
+
+/*
+ * Console + ramoops logging for the helper files (shim/starqltechn/dsi.c).
+ * Same stream as the loader's out()/hex()/kv(): every line ends up both on the
+ * panel and in the two ramoops zones, in the existing "STARQ ..." style.
+ */
+void starq_out(const char *s);
+void starq_hex(uint64_t v);
+void starq_kv(const char *k, uint64_t v);
+

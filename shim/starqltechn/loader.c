@@ -34,10 +34,18 @@
  *                      e.g. starqwin=0xA2000000:0x18000000. Only the accepted
  *                      window changes: the payload's phys_base/mem_size from
  *                      the ADT stay authoritative for the copies.
+ *   starqelvss=LIST    send these DCS writes to the panel over DSI0 before
+ *                      jumping to XNU, e.g. starqelvss=b5,8f,dc,0a or
+ *                      starqelvss=f0,5a,5a;b5,8f,dc,0a. Bytes are hex, ','.
+ *                      separates the bytes of one command, ';' the commands.
+ *                      Absent -> nothing is sent (see STARQ_ELVSS_DEFAULT).
+ *   starqdsisw=1       trigger the command DMA immediately instead of
+ *                      scheduling it into the vertical blanking window.
  */
 #include <stdint.h>
 #include "../fdt.h"
 #include "../font.h"
+#include "dsi.h"
 #include "loader.h"
 
 /* ---- board facts (sdm845-samsung-starqltechn.dts, sdm845.dtsi) ----
@@ -120,6 +128,18 @@
  * turn it off. */
 #ifndef STARQ_FB_TEST
 #define STARQ_FB_TEST		1
+#endif
+
+/* Panel ELVSS override, sent over DSI after the test pattern and before the
+ * jump to XNU (see dsi.c). EMPTY means "send nothing": the boot-arg
+ * starqelvss=<hex list> is then the only way to send anything, which is the
+ * right default because a wrong 0xB5 leaves the panel with a bad black level
+ * until the next reboot. To bake a value into an image, build with
+ *   CFLAGS_EXTRA='-DSTARQ_ELVSS_DEFAULT="b5,8f,dc,0a"'
+ * The format is the boot-arg's: comma-separated bytes, commands separated by
+ * ';'. The value another agent computes for the degraded panel goes here. */
+#ifndef STARQ_ELVSS_DEFAULT
+#define STARQ_ELVSS_DEFAULT	""
 #endif
 
 /* Cache maintenance and barriers mean nothing on the host, where
@@ -270,6 +290,24 @@ static void kv(const char *k, uint64_t v)
 	out("=");
 	hex(v);
 	out(" ");
+}
+
+/* Console + ramoops logging for shim/starqltechn/dsi.c: the same stream, so a
+ * "STARQ DSI:" line lands on the panel and in both ramoops zones like every
+ * other line of this loader. */
+void starq_out(const char *s)
+{
+	out(s);
+}
+
+void starq_hex(uint64_t v)
+{
+	hex(v);
+}
+
+void starq_kv(const char *k, uint64_t v)
+{
+	kv(k, v);
 }
 
 /* ---- payload (tools/mkpayload.py v1), layouts in loader.h ---- */
@@ -575,6 +613,35 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr,
 	for (int i = 0; i < BOOT_LINE_LENGTH && p->cmdline[i]; i++) {
 		char c[2] = { p->cmdline[i], 0 };
 		out(c);
+	}
+	out("\n");
+
+	/* Panel ELVSS override over DSI. S-Boot leaves the DSI link up, so the
+	 * panel's own registers can be written without an MDSS driver; see
+	 * dsi.c for the register sequence and what is deliberately left alone.
+	 * Nothing is sent unless the boot-arg is there (or a compiled default
+	 * was set), because a wrong 0xB5 leaves the panel with a bad black
+	 * level until the next reboot.
+	 *
+	 * The registers are not even read when there is nothing to send: a
+	 * read of an unclocked MDSS block can hang the interconnect on
+	 * Qualcomm, and that would cost an Odin flash. The snapshot is
+	 * diagnostics for a transfer we are about to attempt. */
+	{
+		const char *elvss = arg_val(p->cmdline, "starqelvss=");
+		const char *spec = elvss ? elvss : STARQ_ELVSS_DEFAULT;
+
+		if (!elvss && !spec[0]) {
+			out("STARQ DSI: no starqelvss, DSI0 left alone\n");
+		} else if (starq_dsi_init(STARQ_DSI_CTRL_PA,
+					  STARQ_DSI_PHY_PA) == 0) {
+			if (arg_val(p->cmdline, "starqdsisw=1"))
+				starq_dsi_set_sw_trigger(1);
+			out(elvss ? "STARQ DSI: starqelvss from cmdline\n"
+				  : "STARQ DSI: starqelvss from the compiled default\n");
+			if (starq_dsi_run(spec) < 0)
+				out("STARQ DSI: override not applied\n");
+		}
 	}
 	out("\n");
 
