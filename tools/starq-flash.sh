@@ -20,11 +20,40 @@ usage() {
 
 die() { echo "error: $*" >&2; exit 1; }
 
+# adb reports 'device' for Android and 'recovery' for TWRP. Both give a real
+# shell, and the shell is all this script uses, so both are usable. 'sideload'
+# is not: TWRP's sideload mode only answers `adb sideload`, not `adb shell`.
+# Multi-device is adb's own job - ANDROID_SERIAL, when set, is honoured by adb.
 need_adb() {
 	command -v "$ADB" >/dev/null 2>&1 || die "adb not found in PATH"
 	local state
 	state=$($ADB get-state 2>/dev/null || true)
-	[ "$state" = device ] || die "no adb device (state '${state:-none}'); boot TWRP and check 'adb devices'"
+	case "$state" in
+	device|recovery) ;;
+	unauthorized)
+		die "adb state 'unauthorized': accept the USB debugging (RSA fingerprint) prompt on the phone, then retry" ;;
+	sideload)
+		die "adb state 'sideload': TWRP is in sideload mode and has no adb shell there; go back to the TWRP main menu" ;;
+	offline|'')
+		die "adb state '${state:-none}': replug the USB cable, then check 'adb devices' (want 'device' or 'recovery')" ;;
+	*)
+		die "adb state '$state': need 'device' (Android) or 'recovery' (TWRP); check 'adb devices'" ;;
+	esac
+	# The state string is not proof of a shell - a half-dead connection reports a
+	# state and then fails every command - and every subcommand needs the shell.
+	# A marker, not the exit status: old adb does not forward it.
+	[ "$($ADB shell 'echo starq-adb-ok' 2>/dev/null | tr -d '\r')" = starq-adb-ok ] \
+		|| die "adb state '$state' but 'adb shell' does not work; replug the cable, and reboot TWRP if that does not help"
+
+	local root=no who="not root"
+	case "$($ADB shell id 2>/dev/null || true)" in *uid=0*) root=yes; who=root ;; esac
+	echo "== adb: state '$state', shell ok, $who" >&2
+	# Writing the boot partition is meant to happen from TWRP. Android's adbd is
+	# unrooted by default, and dd to a block device needs uid 0.
+	if [ "$state" = device ] && [ "$root" = no ]; then
+		echo "warning: the phone is in Android, not TWRP, and adb is unrooted: dd to a" >&2
+		echo "  block device will fail. Reboot to TWRP (Vol Up + Bixby + Power) to flash." >&2
+	fi
 }
 
 # The boot node name is not guaranteed across firmware: Samsung TWRP exposes
