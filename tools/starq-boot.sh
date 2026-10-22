@@ -8,13 +8,17 @@
 #
 # STOCK_BOOT.img is the phone's own boot image (data/boot.emmc.win.img or
 # backup/starq/boot.img, see tools/starq-flash.sh). It supplies the header
-# S-Boot expects (addresses, page size, os_version/patch level, name) and the
-# DTBs. The packer probes its shape, so either stock shape works:
+# ABL expects (addresses, page size, os_version/patch level, name, cmdline) and
+# the DTBs. The packer probes its shape, so either stock shape works:
 #   - a dt section holding a Qualcomm DTBH table (older stock/port images), or
-#   - Image.gz-dtb: dt_size 0, the DTBs appended to the kernel (what the
-#     starqltechn stock and ROM images are). Then the stock DTB set is appended
-#     to our Image, dt_size stays 0, and S-Boot's board-id selection is
-#     unchanged.
+#   - Image.gz-dtb: dt_size 0, the DTBs appended after a gzip stream (what the
+#     starqltechn stock and ROM images are). Then our Image is gzipped, the
+#     stock DTB set is appended right after the gzip member, and dt_size stays 0.
+#
+# The gzip step is not optional on this board: with header v0 ABL takes the DTB
+# offset from the end of the gzip member and never reads dt_size, so a raw
+# Image leaves it with DtbOffset 0, no tree, and no jump to the kernel (the
+# phone just lands in recovery with a blank screen -- seen on hardware).
 #
 # There is no fastboot on this phone: the result is written to /dev/block/
 # by-name/boot from TWRP with tools/starq-flash.sh.
@@ -44,6 +48,11 @@ shift 3
 # Console ON by default: this board has no serial port, so text on the panel is
 # the only way to see how far boot got.
 args=${*:-$DEFAULT_ARGS}
+# These args go into the payload cmdline (tools/mkpayload.py), NOT into the
+# boot.img header. The header cmdline stays the stock one, because ABL merges it
+# into /chosen/bootargs and the loader reads msm_drm.dsi_display0 from there to
+# pick the panel (AMB577PX01 vs AMB577MQ01) and the ELVSS byte. Override it with
+# tools/starq_mkboot.py --cmdline/--empty-cmdline if that ever has to change.
 
 [ -f "$kernel" ] || { echo "error: kernel not found: $kernel" >&2; exit 1; }
 [ -f "$stock" ] || { echo "error: stock boot image not found: $stock" >&2; exit 1; }
@@ -90,10 +99,11 @@ BOARD=starqltechn PACK=0 bash "$repo/shim/build.sh" "$work/payload.bin"
 
 echo "== boot.img (stock header + DTBs from $stock)"
 # The packer probes the stock image and takes the right path itself:
-#   dt_size > 0        -> dt section is a DTBH table, carried verbatim
-#   dt_size == 0       -> kernel is Image.gz-dtb (gzip + appended FDTs), so the
-#                         DTBs are appended to our Image instead and dt_size
-#                         stays 0. Nothing extra is needed here.
+#   dt_size > 0        -> dt section is a DTBH table, carried verbatim; the
+#                         kernel stays raw (ABL finds the DTBs via dt_size)
+#   dt_size == 0       -> kernel is Image.gz-dtb, so the packer gzips our Image
+#                         and appends the DTBs right after the gzip member,
+#                         keeping dt_size 0. Nothing extra is needed here.
 # DTB_FILE=... substitutes another table/set: a DTBH table for the first shape,
 # a file or directory of bare FDTs for the second (the packer picks --dtb or
 # --dtb-set and rejects the wrong one).
@@ -101,10 +111,11 @@ shape=$(python3 "$repo/tools/starq_mkboot.py" --shape "$stock")
 case "$shape" in
 dtbh)     echo "   stock shape: DTBH dt section" ;;
 appended) echo "   stock shape: Image.gz-dtb (dt_size 0, appended FDTs); the packer" \
-               "appends the stock DTB set to our Image and keeps dt_size 0" ;;
+               "gzips our Image and appends the stock DTB set, dt_size stays 0" ;;
 *)        echo "error: $stock is a boot.img v0 with neither a DTBH dt section nor DTBs" >&2
-          echo "       appended to its kernel; S-Boot would have no tree to boot with." >&2
-          echo "       Point STOCK_BOOT at the phone's own boot.img (see NOTES.md)." >&2
+          echo "       appended to its kernel; the bootloader would have no tree to" >&2
+          echo "       boot with. Point STOCK_BOOT at the phone's own boot.img (see" >&2
+          echo "       NOTES.md)." >&2
           exit 1 ;;
 esac
 if [ -n "${DTB_FILE:-}" ]; then

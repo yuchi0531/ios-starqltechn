@@ -2,7 +2,55 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-22 (latest): the boot.img kernel slot must be GZIP — that was the boot-to-recovery bug <<<
+
+**Hardware result.** The 27,828,224-byte image above was flashed to
+`/dev/block/by-name/boot` (`/dev/block/sda20`, write verified byte-identical on read-back) on
+this SCV38 (`starqltekdi`, Android 13). On reboot the phone went **straight to TWRP with a
+blank screen** — our loader never executed. Diagnosed, not guessed: this phone is **Qualcomm
+ABL** (`bota` carries `abl.elf`), not Exynos S-Boot.
+
+**Root cause (`QcomModulePkg/Library/BootLib/BootLinux.c`).** For header v0 ABL **never reads
+`dt_size`**: it derives the DTB offset from where the kernel slot's **gzip member ends**
+(`decompress()` writes `*pos = next_in - in_buf + 8` into `BootParamlistPtr->DtbOffset`). Our
+kernel slot was a **raw `Image` + appended FDTs**, so `is_gzip_package()` was false,
+`GZipPkgCheck()` skipped the assignment, `DtbOffset` stayed 0, `DeviceTreeAppended(0)` bailed
+out, the `SingleDtHdr` fallback was the `ANDROID!` magic, `fdt_check_header` failed →
+`EFI_NOT_FOUND` → `BootLinux()` returned **before the jump**. Blank screen, no loader.
+
+**`dt_size == 0` was fine and the pasted DTB set was fine** — only the kernel slot had to
+change. The fix:
+
+- `tools/starq_mkboot.py` now gzips the kernel argument on the `appended` shape (fixed
+  `mtime=0`, level 9, so packing is reproducible; a file that already starts `1f 8b` passes
+  through), appends the DTB set after the member, and asserts `d00dfeed` sits exactly at the
+  member end. `--no-gzip-kernel` reproduces the old, non-booting layout for debugging. The
+  DTBH path is untouched: there ABL finds the DTBs through the header `dt` offset, so the
+  kernel stays raw (and the sweet flow keeps working).
+- New layout: kernel slot **11,175,665 B** = gzip **10,347 B** (from the 56,384-B `Image`)
+  + DTB set **11,165,318 B**, `d00dfeed` at slot `0x286b`; image **27,783,168 B**, fits the
+  64 MiB partition.
+- **Second, independent bug in the same review: the cmdline was zeroed.** The packer now
+  copies the stock cmdline verbatim (`--cmdline STR` / `--empty-cmdline` to override). An
+  empty cmdline does not block boot — ABL synthesises most of it — but it loses
+  `msm_drm.dsi_display0`, which the loader reads out of `/chosen/bootargs` to pick the panel
+  (`AMB577PX01` vs `AMB577MQ01`) and the ELVSS byte. Our own boot-args still travel in the
+  **payload** cmdline, and the loader keeps preferring that for `starq*` tokens.
+  Checked against the phone's own pulled DT (`data/live.dtb`, gitignored): its
+  `/chosen/bootargs` is the **stock boot.img cmdline as a literal prefix**, followed by ABL's
+  own additions (`root=`, `androidboot.serialno=`, `msm_drm.dsi_display0=<panel>:`, …). So the
+  header cmdline really is what ABL merges, and clearing it removes that token.
+- Host verification (no phone): gzip at slot+0, `d00dfeed` exactly at `len(gz)`, 15 FDTs,
+  `zlib.decompressobj(16+MAX_WBITS).unused_data` == the DTB set (the property ABL relies on),
+  header differs from stock only in `kernel_size`/`ramdisk_size`/`id`, cmdline byte-identical,
+  `SEANDROIDENFORCE` present, id valid, two packs byte-identical.
+
+**Next:** flash this image; the loader should now run and paint the framebuffer pattern.
+
 ### >>> UPDATE 2026-10-22: real boot partition pulled — Image.gz-dtb, RAM window confirmed, Odin4 flash path <<<
+
+*(The packer/cmdline detail below was superseded by the section above: the kernel slot must be
+gzip, and the cmdline is now the stock one. The measurements and the RAM window stand.)*
 
 **Read this first.** The phone's own boot partition is now on disk, so the two facts this
 port had been assuming can be checked instead of guessed - one was **wrong**, the other was
@@ -101,7 +149,9 @@ Header diffed against the stock template: **only** `kernel_size` and `ramdisk_si
 `kernel_addr`, `ramdisk_addr`, `second_*`, `tags_addr`, `page_size`, `dt_size` (stays 0) and
 `os_version` are byte-identical; the appended DTB set is byte-identical to stock (15 FDTs);
 trailer `SEANDROIDENFORCE`; SHA-1 valid. The loader `Image` is now **56,384 bytes** - every
-earlier size quoted for it (56,096, 46,816) is stale.
+earlier size quoted for it (56,096, 46,816) is stale. *(That build had a **raw** kernel slot
+and an **empty** cmdline; both are wrong for ABL and are fixed in the section above. It is the
+image that booted to recovery on hardware.)*
 
 **Still unresolved, and it is now the only thing blocking the display work: command mode or
 video mode?** The live DTB does not answer it (it declares both panels, and declares them
@@ -167,6 +217,8 @@ these images).
   `out_kernel = Image + dtb_set`, reusing the stock DTB bytes verbatim (or
   `--dtb-set DIR_OR_FILE`). The DTBH path still works unchanged. Refuses a set with zero
   parseable FDTs, warns on a different board-id set. The id rule was corrected.
+  *(Superseded: the kernel slot is now gzipped. `Image + dtb_set` did not boot — see the top
+  section.)*
 - `shim/fdt.c`: **real bug found by this.** `be32()` did a plain `u32` load and the
   in-tree offsets were aligned as absolute addresses. With the MMU off (Device memory) an
   unaligned load faults, and the odd `0xb5c9d` offset is exactly what our packed image

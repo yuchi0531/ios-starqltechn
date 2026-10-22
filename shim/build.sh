@@ -2,11 +2,11 @@
 # Build the shim and wrap it in a boot image.
 #   BOARD=sweet (default)  -> boot.img v2 with the stock Xiaomi header, the
 #                             Qualcomm ABL shim (shim.c)
-#   BOARD=starqltechn      -> shim/starqltechn/build.sh: the Samsung S-Boot
+#   BOARD=starqltechn      -> shim/starqltechn/build.sh: the starqltechn
 #                             loader, packed into a boot.img v0 that reuses the
-#                             stock Samsung header and DTBs (a DTBH dt section
-#                             or an Image.gz-dtb kernel, whichever the stock
-#                             image has)
+#                             stock Samsung header, cmdline and DTBs (a DTBH dt
+#                             section, or an Image.gz-dtb kernel where our Image
+#                             is gzipped and the FDTs follow the gzip member)
 # FB_* defaults are sweet's; a board overrides them through CFLAGS.
 #
 # Knobs for an external pipeline (tools/starq-boot.sh) on starqltechn:
@@ -19,9 +19,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 BOARD=${BOARD:-sweet}
 # Stock DTB the sweet boot image carries (tools/unpack_bootv2.py -> dtb/).
-# starqltechn gets its DTB from the stock boot.img's DTBH section instead.
+# starqltechn gets its DTB from the stock boot.img instead (its DTBH section, or
+# the FDTs appended to the kernel of an Image.gz-dtb template).
 DTB=${DTB:-../dtb/boot_unpacked/dtb}
-# Stock Samsung boot image: header and DTBH dt section for BOARD=starqltechn.
+# Stock Samsung boot image: header and DTBs for BOARD=starqltechn.
 STOCK_BOOT=${STOCK_BOOT:-}
 PACK=${PACK:-1}
 CC=aarch64-linux-gnu-gcc
@@ -42,23 +43,25 @@ starqltechn)
 	;;
 esac
 
-# starqltechn does not use the Qualcomm ABL shim at all: S-Boot behaves like a
-# Linux bootloader (EL1, MMU off, x0 = DTB, initrd through /chosen) and the
-# image is a Samsung boot.img v0, so shim/starqltechn/ has its own entry, link
-# script, loader and build. Everything below this block is the sweet path.
+# starqltechn does not use the Qualcomm ABL shim (shim.c/mmu.c/ufs.c): the
+# bootloader is Qualcomm ABL, but it loads our kernel the Linux way (EL1, MMU
+# off, x0 = DTB, initrd through /chosen), so the entry point is a plain arm64
+# Image and the packed image is a Samsung boot.img v0. shim/starqltechn/ has its
+# own entry, link script, loader and build. Everything below is the sweet path.
 if [ "$BOARD" = starqltechn ]; then
 	mkdir -p out
 	# CFLAGS_EXTRA passes straight through (e.g. -DSTARQ_FB_TEST=0).
 	if [ "$PACK" = 0 ]; then
 		OUT_DIR=out bash starqltechn/build.sh
 	elif [ $# -ge 3 ]; then
-		# STOCK_BOOT.img PAYLOAD.bin OUT.img [DTBH.bin]
+		# STOCK_BOOT.img PAYLOAD.bin OUT.img [DTBH.bin|FDT_DIR]
 		OUT_DIR=out bash starqltechn/build.sh "$@"
 	elif [ -z "$STOCK_BOOT" ] || [ -z "${1:-}" ]; then
-		# Samsung header v0: use the stock image as the header/DTB donor and a
-		# payload. Either stock shape works (DTBH dt section or Image.gz-dtb;
-		# tools/starq_mkboot.py probes it). There is no mkbootimg layout for
-		# Samsung's header that matches the phone.
+		# Samsung header v0: use the stock image as the header/cmdline/DTB donor
+		# and a payload. Either stock shape works (DTBH dt section or
+		# Image.gz-dtb; tools/starq_mkboot.py probes it and gzips our Image for
+		# the latter). There is no mkbootimg layout for Samsung's header that
+		# matches the phone.
 		echo "error: BOARD=starqltechn packing needs STOCK_BOOT=STOCK.img" >&2
 		echo "       and the payload as \$1 (or: shim/build.sh STOCK PAYLOAD OUT)" >&2
 		echo "       (stock boot image: data/boot.emmc.win.img or backup/starq/boot.img;" >&2

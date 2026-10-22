@@ -6,43 +6,64 @@
   starq_mkboot.py --info IMG
   starq_mkboot.py --shape IMG          # dtbh | appended | none
 
-The stock image is the template, not just a reference: Samsung's S-Boot (their
-Qualcomm ABL) and the qseecom key-update path compare the boot header against
-what Knox/AVB recorded, so we keep every field we do not have to change --
-kernel/ramdisk/second/tags addresses, page size, os_version and os_patch_level,
-board name and the 16-byte "name" field. The S8 port learned this the hard
-way: a header with os_version = 0 makes qseecom fail and the image not boot.
+The stock image is the template, not just a reference: the bootloader (Qualcomm
+ABL on this board) and the qseecom key-update path compare the boot header
+against what Knox/AVB recorded, so we keep every field we do not have to change
+-- kernel/ramdisk/second/tags addresses, page size, os_version and
+os_patch_level, board name and the 16-byte "name" field. The S8 port learned
+this the hard way: a header with os_version = 0 makes qseecom fail and the
+image not boot.
 
 Two stock shapes exist, and the packer picks the right one from the template:
 
 1. DTBH template (dt_size > 0). Samsung reuses the header_version slot (offset
    0x28) as dt_size, and the DT section after the second stage is a Qualcomm
    DTBH table (magic "DTBH"), not a bare FDT. We carry the stock table verbatim
-   unless --dtb gives another DTBH table, because S-Boot's early code and the
-   shim must agree on the same tree.
+   unless --dtb gives another DTBH table, because the bootloader's early code
+   and the shim must agree on the same tree. **The kernel stays raw here**: ABL
+   locates the DTBs through the header's dt offset (DtbOffset = dt_size), so a
+   gzip stream would only add a decompression pass and break the working
+   sweet-style flow. This path is deliberately untouched by --no-gzip-kernel.
 
 2. Image.gz-dtb template (dt_size == 0, no DT section at all -- what the
    starqltechn stock/ROM images are). The kernel slot is a gzip stream
-   followed by concatenated bare FDTs, one per board revision; S-Boot
+   followed by concatenated bare FDTs, one per board revision; the bootloader
    decompresses the kernel and hands the kernel a pointer (x0) to the FDT
    whose qcom,board-id / qcom,msm-id match the hardware. For this shape we
-   keep dt_size = 0 and append the DTB set to whatever kernel blob we write,
-   i.e. out_kernel = kernel + dtb_set:
+   keep dt_size = 0 and write out_kernel = gzip(kernel) + dtb_set:
 
+     - **the gzip stream is mandatory.** With header v0 ABL never reads
+       dt_size to find the DTBs: it decompresses the kernel slot and takes the
+       DTB offset from where the gzip member ended
+       (QcomModulePkg/Library/BootLib/BootLinux.c: decompress() writes
+       *pos = next_in - in_buf + 8 into DtbOffset). A raw Image leaves
+       DtbOffset 0, DeviceTreeAppended(0) bails out, the fallback "single DT"
+       is the ANDROID! magic and fdt_check_header fails -- BootLinux returns
+       before the jump, so the phone lands in recovery with a blank screen.
+       That is exactly what a raw kernel slot did on hardware. So the packer
+       gzips the kernel argument (unless it already is gzip, which is passed
+       through unchanged) with a fixed mtime and level so the same inputs give
+       the same bytes; --no-gzip-kernel exists for debugging only;
      - the default set is the exact bytes the stock kernel carried after its
-       gzip stream, so the board-id set is unchanged and S-Boot's selection
-       keeps working;
+       gzip stream, so the board-id set is unchanged and the bootloader's
+       selection keeps working; dt_size == 0 is legal for this shape;
      - --dtb-set DIR_OR_FILE substitutes another set (a file of concatenated
        FDTs, or a directory of one-FDT-per-file).
 
-   Our own kernel blob is the loader Image built by shim/starqltechn/: it is
-   NOT gzipped, and S-Boot's decompressor is not involved because the Image is
-   ours. A raw Image followed by the DTBs is therefore the correct analogue of
-   Image.gz-dtb -- the same "kernel blob with the DTBs riding at its tail" that
-   S-Boot expects, minus a compression step nobody needs. This is what the
-   packer writes, and it prints that decision.
+   Our kernel blob is the loader Image built by shim/starqltechn/, and it is
+   gzipped exactly like the stock one: ABL relies on the gzip member's end to
+   find the appended DTBs, and the DTBs must therefore start immediately after
+   it.
 
-The trailer is what the other Android parts of S-Boot expect:
+The cmdline is copied from the template by default. An empty cmdline is not a
+boot blocker -- ABL synthesises most of what the kernel needs -- but it loses
+the stock msm_drm.dsi_display0=... token, and the loader reads that from
+/chosen/bootargs to pick the panel (AMB577PX01 vs AMB577MQ01) and the ELVSS
+byte. Our own boot-args never go here: they travel in the payload cmdline
+(tools/mkpayload.py), which the loader keeps preferring for starq* arguments.
+--cmdline STR overrides the field, --empty-cmdline restores the old zeroing.
+
+The trailer is what the other Android parts of the bootloader expect:
 
   0x240  id[32]  = SHA-1 over kernel|ramdisk|second, each followed by its u32
                    length (the AOSP boot.img v0 signature; the dt section is
@@ -55,6 +76,7 @@ Same recipe as Floppikrob/ios-galaxy-s8 tools/dreamlte_mkboot.py, plus the
 validation that script leaves to the caller.
 """
 import argparse
+import gzip
 import hashlib
 import os
 import struct
@@ -69,6 +91,9 @@ GZIP_MAGIC = b'\x1f\x8b'
 TRAILER = b'SEANDROIDENFORCE'
 NAME_OFF, CMDLINE_OFF = 0x30, 0x40
 CMD_LEN, ID_OFF, EXTRA_OFF, EXTRA_LEN = 0x200, 0x240, 0x260, 0x400
+# Fixed gzip parameters: the packed image must be reproducible from the same
+# inputs, so no timestamp in the member header and no "adaptive" level choice.
+GZIP_LEVEL, GZIP_MTIME = 9, 0
 SECTIONS = ('kernel', 'ramdisk', 'second', 'dt')
 # FDT structure block tokens (Devicetree Specification 5.4.1).
 FDT_BEGIN_NODE, FDT_END_NODE, FDT_PROP, FDT_NOP, FDT_END = 1, 2, 3, 4, 9
@@ -239,6 +264,12 @@ def gzip_stream_len(blob):
     return len(blob) - len(d.unused_data)
 
 
+def gzip_plain_len(blob):
+    """Decompressed length of the gzip member at the start of blob."""
+    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    return len(d.decompress(blob))
+
+
 def appended_dtbs(blob):
     """(offset, entries, dtb_blob) of the FDTs appended to a kernel blob, else None.
 
@@ -280,7 +311,7 @@ def describe(entries, blob_name=''):
           + (f' ({blob_name})' if blob_name else ''))
     off, total, model, board, msm = entries[0]
     bd = '(' + ' '.join(f'{c:#x}' for c in board) + ')'
-    print('  selection    S-Boot hands the kernel (x0) the entry whose qcom,board-id /'
+    print('  selection    ABL hands the kernel (x0) the entry whose qcom,board-id /'
           '\n               qcom,msm-id match this phone; the image does not record which'
           f'\n               one that is. First entry: "{model}" board-id={bd}')
 
@@ -313,7 +344,7 @@ class Boot:
                         "this at the phone's own stock boot.img.)")
             die(f'{path}: the dt section at {self.section_off("dt"):#x} starts with '
                 f'{self.parts["dt"][:4]!r}, not DTBH.\n'
-                '       S-Boot/ABL parses that area as a Qualcomm DTBH table. If this is a\n'
+                '       ABL parses that area as a Qualcomm DTBH table. If this is a\n'
                 '       plain FDT, it is not a boot.img dt section (Samsung header_version 0\n'
                 '       has no dtb slot; a --dtb argument must point at a whole DTBH table).'
                 + hint)
@@ -357,7 +388,7 @@ class Boot:
 
     def id_state(self):
         if self.id == b'\0' * 32:
-            return 'zeroed (S-Boot will not verify it)'
+            return 'zeroed (the bootloader will not verify it)'
         if self.id != self.digest():
             return 'STALE: does not match the sections'
         hashed = 'kernel+ramdisk+second' + ('+dt' if self.dt_size else '')
@@ -385,12 +416,19 @@ class Boot:
         if app:
             gz = gzip_stream_len(p['kernel'])
             if gz is None:
-                print(f'  kernel blob  raw Image + appended DTBs at {app[0]:#x} '
-                      f'({len(app[2]):#x} bytes, {len(app[1])} FDTs); not gzipped')
+                print(f'  kernel slot  RAW: no gzip member; appended DTB set at '
+                      f'kernel+{app[0]:#x} ({len(app[2]):#x} bytes, {len(app[1])} FDTs)')
+                print('               ABL takes the DTB offset from the end of a gzip '
+                      'member and leaves it 0\n'
+                      '               for a raw Image, so this layout does not boot on '
+                      'this board')
             else:
-                print(f'  kernel blob  Image.gz-dtb: gzip {gz:#x} -> decompressed, '
-                      f'appended DTB set at +{app[0]:#x} '
-                      f'({len(app[2]):#x} bytes, {len(app[1])} FDTs)')
+                print(f'  kernel slot  GZIP: member {gz:#x} bytes at kernel+0x0 '
+                      '(1f 8b), decompresses to '
+                      f'{gzip_plain_len(p["kernel"]):#x} bytes')
+                print(f'               appended DTB set starts at kernel+{app[0]:#x} '
+                      f'(= the gzip member end), {len(app[2]):#x} bytes, '
+                      f'{len(app[1])} FDTs -- what ABL uses as DtbOffset')
         print(f'  tags_addr    {self.tags_addr:#x}')
         dt = self.dtbh()
         if not self.dt_size:
@@ -434,7 +472,7 @@ def read_dt(path):
         return blob
     if len(blob) >= 4 and struct.unpack_from('>I', blob, 0)[0] == FDT_MAGIC:
         die(f'{path}: a bare FDT (magic d00dfeed), not a DTBH table.\n'
-            '       S-Boot does not look at bare FDTs in the boot.img dt slot; it parses\n'
+            '       ABL does not look at bare FDTs in the boot.img dt slot; it parses\n'
             '       the Qualcomm DTBH table. A stock image with no dt section at all\n'
             '       (starqltechn: Image.gz-dtb) takes --dtb-set FILE_OR_DIR instead.')
     die(f'{path}: neither DTBH nor an FDT (magic {blob[:4]!r})')
@@ -476,7 +514,8 @@ def appended_set_check(new_blob, stock_entries, what):
     """
     entries = fdt_chain(new_blob, 0)
     if entries is None:
-        die(f'{what} contains no parseable FDT; S-Boot would have no tree to hand over')
+        die(f'{what} contains no parseable FDT; the bootloader would have no tree '
+            'to hand over')
     if stock_entries is None:
         return entries
 
@@ -489,14 +528,86 @@ def appended_set_check(new_blob, stock_entries, what):
         warn(f'{what} has a different qcom,board-id set than the stock image.\n'
              f'       stock {want}\n'
              f'       new   {have}\n'
-             '       S-Boot selects the DTB by board-id: a set that does not match this '
-             'phone can\n'
+             '       The bootloader selects the DTB by board-id: a set that does not '
+             'match this phone can\n'
              '       leave it handing the kernel a tree that does not describe the hardware.')
     return entries
 
 
+def gzip_kernel(kernel):
+    """The kernel slot's gzip member, reproducible from the same input bytes.
+
+    Fixed level and mtime because the member header carries the timestamp: with
+    time.time() in it, packing twice would give two different images
+    (mtime bytes 4..8 of the header, plus the CRC/OS byte).
+    """
+    return gzip.compress(kernel, GZIP_LEVEL, mtime=GZIP_MTIME)
+
+
+def kernel_slot(kernel, dtb_set, gzip_it):
+    """(slot, gz_len) for the appended-DTBs shape: gzip member + bare FDTs.
+
+    ABL finds the DTBs immediately after the gzip member (it never reads
+    dt_size for header v0), so the gzip stream is a hard requirement, not a
+    size optimisation. A caller-supplied file that is already gzip is passed
+    through unchanged so an Image.gz from CI packs as-is.
+    """
+    if kernel[:2] == GZIP_MAGIC:
+        gz_len = gzip_stream_len(kernel)
+        print(f'kernel       {len(kernel):,} B already a gzip stream at offset 0 '
+              f'(1f 8b), passed through unchanged')
+    elif not gzip_it:
+        print('warning: --no-gzip-kernel: the kernel slot stays a raw Image.\n'
+              '         ABL derives the DTB offset from the end of the gzip member '
+              'and leaves it 0 for a\n'
+              '         raw Image, so it will not find the appended DTBs and will '
+              'not jump to the kernel\n'
+              '         (the phone falls through to recovery). Debugging only.',
+              file=sys.stderr)
+        gz_len = None
+    else:
+        raw_len = len(kernel)
+        kernel = gzip_kernel(kernel)
+        gz_len = len(kernel)
+        print(f'kernel       {raw_len:,} B raw -> gzipped {gz_len:,} B '
+              f'(mtime={GZIP_MTIME}, level {GZIP_LEVEL})')
+
+    slot = kernel + dtb_set
+    if gz_len is not None:
+        # The one property ABL relies on: the FDT set starts exactly where the
+        # single gzip member ends. If it does not, DtbOffset would point into
+        # the middle of the DTB set and fdt_check_header would fail.
+        if slot[gz_len:gz_len + 4] != FDT_MAGIC_BYTES:
+            die(f'the appended DTB set does not start at the end of the gzip member '
+                f'({gz_len:#x}): found {slot[gz_len:gz_len + 4]!r}, want '
+                f'd0 0d fe ed.\n'
+                '       The DTB set is missing, empty or padded; the bootloader would '
+                'compute a DtbOffset\n'
+                '       that does not point at an FDT and refuse to boot.')
+        print(f'kernel slot  gzip {gz_len:,} B + DTB set {len(dtb_set):,} B = '
+              f'{len(slot):,} B; d00dfeed at {gz_len:#x} (the gzip member end)')
+    else:
+        print(f'kernel slot  raw Image {len(kernel):,} B + DTB set '
+              f'{len(dtb_set):,} B = {len(slot):,} B; d00dfeed at {len(kernel):#x}')
+    return slot, gz_len
+
+
+def cmdline_field(stock, text, empty):
+    """(bytes, label) for the 0x40 cmdline field."""
+    if empty:
+        return b'', 'empty (--empty-cmdline: the stock msm_drm.dsi_display0 token is gone)'
+    if text is None:
+        raw = stock.buf[CMDLINE_OFF:CMDLINE_OFF + CMD_LEN].split(b'\0')[0]
+        return raw, f'stock, copied verbatim ({len(raw)} B)'
+    raw = text.encode()
+    if len(raw) >= CMD_LEN:
+        die(f'--cmdline is {len(raw)} bytes; the v0 field holds at most {CMD_LEN - 1} '
+            '(it must stay NUL-terminated)')
+    return raw, f'--cmdline ({len(raw)} B)'
+
+
 def pack(stock_path, kernel_path, ramdisk_path, out_path, dtb_path=None,
-         dtb_set_path=None):
+         dtb_set_path=None, gzip_it=True, cmdline=None, empty_cmdline=False):
     stock = Boot(stock_path)
     kernel = open(kernel_path, 'rb').read()
     ramdisk = open(ramdisk_path, 'rb').read()
@@ -510,19 +621,24 @@ def pack(stock_path, kernel_path, ramdisk_path, out_path, dtb_path=None,
     if len(kernel) > space:
         die(f'kernel is {len(kernel)} bytes, larger than the {space} bytes the stock '
             f'image implied for it.\n'
-            '       S-Boot loads the kernel at the header address and the ramdisk after\n'
-            '       it; growing past that means the image no longer matches what the stock\n'
-            '       header describes. Shrink the kernel, or re-derive the header.')
-    plain_kernel_size = len(kernel)
+            '       the bootloader loads the kernel at the header address and the ramdisk\n'
+            '       after it; growing past that means the image no longer matches what the\n'
+            '       stock header describes. Shrink the kernel, or re-derive the header.')
 
-    dtb_set = None
+    dtb_set, gz_len = None, None
     if stock.dt_size:
         if dtb_set_path:
             die('--dtb-set is for a stock image whose DTBs are appended to the kernel; '
                 f'{stock_path} has a DTBH dt section, use --dtb')
+        if not gzip_it:
+            die('--no-gzip-kernel is for the appended-DTB shape only; a DTBH template '
+                'keeps its kernel raw\n'
+                '       because the bootloader finds the DTBs through the header dt '
+                'offset, not the gzip end')
         dt = read_dt(dtb_path) if dtb_path else stock.parts['dt']
         print(f'dt shape     DTBH table in the dt section ({len(dt)} bytes, '
-              f'{stock.dtbh()[1] if stock.dtbh() else "?"} entries)')
+              f'{stock.dtbh()[1] if stock.dtbh() else "?"} entries); '
+              'the kernel stays raw')
     else:
         if dtb_path:
             die('--dtb is a DTBH table; '
@@ -534,8 +650,8 @@ def pack(stock_path, kernel_path, ramdisk_path, out_path, dtb_path=None,
             dtb_set = read_dtb_set(dtb_set_path)
             entries = appended_set_check(
                 dtb_set, app[1] if app else None, f'--dtb-set {dtb_set_path}')
-            print(f'dt shape     no dt section (dt_size stays 0); Image + DTBs, '
-                  f'{len(entries)} FDTs appended from {dtb_set_path}')
+            print(f'dt shape     no dt section (dt_size stays 0); gzip kernel + DTBs, '
+                  f'{len(entries)} FDTs from {dtb_set_path}')
             if not app:
                 print(f'             the stock kernel carried no DTB set, so there is '
                       'nothing to compare board-ids\n'
@@ -549,17 +665,13 @@ def pack(stock_path, kernel_path, ramdisk_path, out_path, dtb_path=None,
         else:
             die('the stock image has neither a dt section nor DTBs appended to its '
                 'kernel, and no --dtb-set was given;\n'
-                '       S-Boot needs a tree to hand the kernel. A starqltechn stock image '
-                'has dt_size = 0 with Image.gz-dtb, pass that one.')
-        kernel = kernel + dtb_set
-        print('             the new kernel blob is a raw Image + those DTBs, not gzipped: '
-              'our Image is our\n'
-              '             own loader, so S-Boot has nothing to decompress -- Image + DTBs '
-              'is the exact\n'
-              '             analogue of Image.gz-dtb')
+                '       the bootloader needs a tree to hand the kernel. A starqltechn '
+                'stock image has dt_size = 0 with Image.gz-dtb, pass that one.')
+        kernel, gz_len = kernel_slot(kernel, dtb_set, gzip_it)
 
     print(f'kernel  {len(kernel)} bytes'
-          + (f' = Image {plain_kernel_size} + DTBs {len(dtb_set)}' if dtb_set
+          + (f' = {"gzip " if gz_len else "raw "}{len(kernel) - len(dtb_set)} + DTBs '
+             f'{len(dtb_set)}' if dtb_set
              else f' of the {space} the stock image reserves (stock kernel {stock.kernel_size})')
           + ('' if not dtb_set else f'; the stock kernel slot was {space} '
              f'(stock kernel {stock.kernel_size})'))
@@ -567,24 +679,31 @@ def pack(stock_path, kernel_path, ramdisk_path, out_path, dtb_path=None,
     if dtb_set and len(kernel) > space:
         # The stock Image.gz-dtb kernel slot is gzip + DTBs, so the DTBs already
         # lived outside the "kernel size" the header counted for the compressed
-        # part. Same shape here, one compression step fewer; only the partition
-        # limit is real.
+        # part. Same shape here; only the partition limit is real.
         print(f'note: the kernel blob is {len(kernel) - space} bytes past the slot the '
               'stock header implied, because the\n'
-              f'      {len(dtb_set)}-byte DTB set now rides at its tail. That is the '
+              f'      {len(dtb_set)}-byte DTB set rides at its tail. That is the '
               'Image.gz-dtb shape:\n'
-              '      Samsung counts only the compressed part in kernel_size. The ceiling '
-              'that matters\n'
+              '      the header counts only the compressed part in kernel_size. The '
+              'ceiling that matters\n'
               '      is the partition, checked below.')
     if stock.second_size:
         print(f'warning: the stock image has a {stock.second_size}-byte second stage; '
               'the new image has none', file=sys.stderr)
 
+    cmd_raw, cmd_label = cmdline_field(stock, cmdline, empty_cmdline)
+    print(f'cmdline      {cmd_label}: {cmd_raw[:96]!r}'
+          + (f' +{len(cmd_raw) - 96} B' if len(cmd_raw) > 96 else ''))
+
     hdr = bytearray(stock.buf[:page])
     struct.pack_into('<10I', hdr, 8, len(kernel), stock.kernel_addr, len(ramdisk),
                      stock.ramdisk_addr, 0, stock.second_addr, stock.tags_addr, page,
                      len(dt), stock.os_version)
-    hdr[CMDLINE_OFF:CMDLINE_OFF + CMD_LEN] = b'\0' * CMD_LEN   # empty, as stock
+    # The cmdline is the stock one unless the caller says otherwise. Our own
+    # boot-args stay in the payload cmdline: the loader prefers that for starq*
+    # tokens, and this field is what ABL merges into /chosen/bootargs.
+    hdr[CMDLINE_OFF:CMDLINE_OFF + CMD_LEN] = b'\0' * CMD_LEN
+    hdr[CMDLINE_OFF:CMDLINE_OFF + len(cmd_raw)] = cmd_raw
     hdr[EXTRA_OFF:EXTRA_OFF + EXTRA_LEN] = b'\0' * EXTRA_LEN
 
     parts = dict(kernel=kernel, ramdisk=ramdisk, second=b'', dt=dt)
@@ -598,8 +717,10 @@ def pack(stock_path, kernel_path, ramdisk_path, out_path, dtb_path=None,
     out += b'\0' * (pages(len(out), page) - len(out))
     open(out_path, 'wb').write(out)
     print(f'{out_path}: {len(out)} bytes (page {page}, dt_size {len(dt)}, '
-          f'kernel {len(kernel)}{" = Image + DTBs" if dtb_set else ""}, '
-          f'id {hdr[ID_OFF:ID_OFF + 20].hex()})')
+          f'kernel {len(kernel)}'
+          + (f' = {"gzip" if gz_len else "raw"} {len(kernel) - len(dtb_set)} + DTBs'
+             if dtb_set else '')
+          + f', id {hdr[ID_OFF:ID_OFF + 20].hex()})')
     if len(out) <= len(stock.buf):
         print(f'fits: {len(stock.buf) - len(out)} bytes of slack against the '
               f'{len(stock.buf)}-byte stock image (the whole boot partition on this '
@@ -622,17 +743,23 @@ def main():
     ap = argparse.ArgumentParser(
         description='Pack or inspect a Samsung boot.img v0 (starqltechn).',
         epilog='The stock image selects the shape. If it has a dt section (DTBH\n'
-               'table) that table is carried verbatim, or replaced with --dtb.\n'
+               'table) that table is carried verbatim, or replaced with --dtb; the\n'
+               'kernel stays raw there, because ABL finds the DTBs through the\n'
+               'header dt offset.\n'
                'If dt_size is 0 and the kernel is Image.gz-dtb (a gzip stream\n'
                'followed by bare FDTs, one per board revision -- what the\n'
-               'starqltechn stock and ROM images are), the DTBs are appended to\n'
-               'our kernel blob instead and dt_size stays 0. Our blob is a raw\n'
-               'Image (our own loader), not gzipped: S-Boot does not decompress\n'
-               'it, so Image + DTBs is the analogue of Image.gz-dtb. --dtb-set\n'
-               'substitutes another DTB set; without it the stock bytes are\n'
-               'reused so the qcom,board-id set stays what S-Boot expects.\n'
-               'Boot-args go into the shim payload, not into the boot.img cmdline\n'
-               '(the stock image has one, but the packer zeroes it); see\n'
+               'starqltechn stock and ROM images are), the kernel is gzipped and\n'
+               'the DTBs are appended after the gzip member, dt_size stays 0. The\n'
+               'gzip is mandatory: ABL takes the DTB offset from the end of the\n'
+               'gzip member and never reads dt_size for header v0, so a raw Image\n'
+               'leaves it with no DTBs and no jump. A kernel that already starts\n'
+               'with 1f 8b is passed through instead of gzipped twice.\n'
+               '--dtb-set substitutes another DTB set; without it the stock bytes\n'
+               'are reused so the qcom,board-id set stays what ABL expects.\n'
+               'The cmdline is copied from the template (ABL merges it into\n'
+               '/chosen/bootargs, where the loader reads msm_drm.dsi_display0 to\n'
+               'pick the panel); --cmdline STR replaces it, --empty-cmdline zeroes\n'
+               'it. Our own boot-args go into the shim payload, not here; see\n'
                'tools/starq-boot.sh.',
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('paths', nargs='+', metavar='PATH',
@@ -646,6 +773,16 @@ def main():
                     help='FDT set to append to the kernel when the stock image has no dt '
                          'section (a file of concatenated FDTs, or a directory of FDTs); '
                          'default: reuse the stock appended set')
+    ap.add_argument('--no-gzip-kernel', action='store_true',
+                    help='debugging only: leave the kernel slot as a raw Image. ABL then '
+                         'cannot find the appended DTBs (it takes that offset from the end '
+                         'of the gzip member) and does not boot')
+    ap.add_argument('--cmdline', metavar='STR',
+                    help='cmdline to write into the header instead of the stock one; this '
+                         'is not where our boot-args go (they travel in the payload)')
+    ap.add_argument('--empty-cmdline', action='store_true',
+                    help='zero the cmdline field (the old behaviour). Loses the stock '
+                         'msm_drm.dsi_display0 token the panel detection reads')
     a = ap.parse_args()
     if a.info or a.shape:
         if len(a.paths) != 1:
@@ -655,10 +792,15 @@ def main():
         else:
             Boot(a.paths[0]).info()
         return 0
+    if a.cmdline is not None and a.empty_cmdline:
+        ap.error('--cmdline and --empty-cmdline are mutually exclusive')
     if len(a.paths) != 4:
         ap.error('usage: starq_mkboot.py STOCK_BOOT.img KERNEL_BIN RAMDISK_BIN OUT.img '
-                 '[--dtb FILE | --dtb-set DIR_OR_FILE]')
-    return pack(*a.paths, dtb_path=a.dtb, dtb_set_path=a.dtb_set)
+                 '[--dtb FILE | --dtb-set DIR_OR_FILE] [--cmdline STR | --empty-cmdline] '
+                 '[--no-gzip-kernel]')
+    return pack(*a.paths, dtb_path=a.dtb, dtb_set_path=a.dtb_set,
+                gzip_it=not a.no_gzip_kernel, cmdline=a.cmdline,
+                empty_cmdline=a.empty_cmdline)
 
 
 if __name__ == '__main__':

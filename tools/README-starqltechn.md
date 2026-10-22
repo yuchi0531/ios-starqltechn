@@ -1,14 +1,19 @@
 # iOS on the Galaxy S9 Snapdragon (`starqltechn`, SM-G9600 / SC-02K)
 
 End-to-end procedure for the Samsung Galaxy S9 with the Qualcomm SDM845 — the
-`starqltechn` board in `tools/mkadt.py`. Nothing here has run on hardware as of
-2026-10-22: the kernel builds in CI (`xnu-kernel` artifact, 17,172,688-byte
-`kernel.development.starqltechn`) and the whole chain from Mach-O to a Samsung
-`boot.img` runs on a Linux host against the phone's **own** pulled boot partition
-(`data/boot.emmc.win.img`, gitignored; see step 2): 56,384-byte loader
-Image, 27,828,224-byte `starq-ios-boot.img` with the stock header, the stock
-`Image.gz-dtb` DTB set and a recomputed kernel SHA-1. The phone side is written
-and unrun. Everything that needs the phone is in "What is still open".
+`starqltechn` board in `tools/mkadt.py`. **This is a Qualcomm ABL phone**
+(`bota` carries `abl.elf`), not an Exynos S-Boot one, and that decides the
+`boot.img` layout: the kernel slot must be a gzip stream with the DTBs right
+after it. Nothing here has run on hardware as of 2026-10-22: the kernel builds in
+CI (`xnu-kernel` artifact, 17,172,688-byte `kernel.development.starqltechn`) and
+the whole chain from Mach-O to a Samsung `boot.img` runs on a Linux host against
+the phone's **own** pulled boot partition (`data/boot.emmc.win.img`, gitignored;
+see step 2): 56,384-byte loader `Image`, 27,783,168-byte `starq-ios-boot.img`
+with the stock header and cmdline, our `Image.gz` + the stock `Image.gz-dtb` DTB
+set and a recomputed kernel SHA-1. A first image with a *raw* kernel slot was
+flashed on hardware and did not boot (see "The gzip stream is mandatory on
+ABL"). The phone side of the fixed image is written and unrun. Everything that
+needs the phone is in "What is still open".
 
 ## Reference ports
 
@@ -137,8 +142,8 @@ That runs, in order:
 | loader compile (`shim/starqltechn/`) | `shim/build.sh` with `BOARD=starqltechn`, `PACK=0` |
 | boot.img v0 pack | `tools/starq_mkboot.py` |
 
-The kernel section is `shim/starqltechn/`'s S-Boot loader, not the Qualcomm ABL
-shim: see "The loader" below.
+The kernel section is `shim/starqltechn/`'s loader, not the Qualcomm ABL shim:
+see "The loader" below.
 
 The default boot-args keep the console **on** (`sweetfb_noconsole=0`): with no
 serial port, text on the panel is the only early output.
@@ -191,8 +196,8 @@ flag selects it.
 
 | Stock shape | Header | DTBs live in | Packer |
 | --- | --- | --- | --- |
-| DTBH | `dt_size > 0`, dt section after the second stage | the dt section (Qualcomm `DTBH` table) | carried verbatim, or `--dtb FILE` |
-| Image.gz-dtb | `dt_size == 0`, no dt section | appended to the kernel blob, after the gzip stream | appended to our `Image`, or `--dtb-set DIR_OR_FILE` |
+| DTBH | `dt_size > 0`, dt section after the second stage | the dt section (Qualcomm `DTBH` table) | carried verbatim, or `--dtb FILE`; **kernel stays raw** |
+| Image.gz-dtb | `dt_size == 0`, no dt section | appended to the kernel blob, after the gzip stream | kernel **gzipped**, set appended after the gzip member, or `--dtb-set DIR_OR_FILE` |
 
 The real starqltechn images (`data/boot.emmc.win.img`, and the
 KernelSU-patched one) are the second shape: page 4096, `kernel_addr=0x8000`,
@@ -201,12 +206,64 @@ KernelSU-patched one) are the second shape: page 4096, `kernel_addr=0x8000`,
 for 13 distinct `qcom,board-id` values Rev02..Rev14.
 
 For that shape the packer keeps `dt_size = 0` and writes
-`out_kernel = Image + dtb_set`, reusing the stock DTB bytes verbatim by default,
-so S-Boot's board-id selection is unchanged. The `Image` is our own loader and
-is **not** gzipped: S-Boot has no decompression to do, so raw `Image` + DTBs is
-the exact analogue of `Image.gz-dtb`.
+`out_kernel = gzip(Image) + dtb_set`, reusing the stock DTB bytes verbatim by
+default, so ABL's board-id selection is unchanged.
 
-**S-Boot picks one of the 15 FDTs by `qcom,board-id`/`qcom,msm-id` and passes it
+#### The gzip stream is mandatory on ABL, not an optimisation
+
+This board's bootloader is **Qualcomm ABL** (`bota` carries `abl.elf`), not
+Samsung's Exynos S-Boot. With boot header v0 ABL **never reads `dt_size`** to
+find the DTBs: it decompresses the kernel slot and derives the DTB offset from
+where the gzip member ended
+(`QcomModulePkg/Library/BootLib/BootLinux.c`: `decompress()` writes
+`*pos = next_in - in_buf + 8` into `BootParamlistPtr->DtbOffset`). So:
+
+| Kernel slot | `is_gzip_package()` | `DtbOffset` | Result |
+| --- | --- | --- | --- |
+| gzip member + FDTs | true | = gzip member end | DTBs found, `BootLinux()` jumps |
+| raw `Image` + FDTs | false | **0** | `DeviceTreeAppended(0)` bails, fallback tree is the `ANDROID!` header, `fdt_check_header` fails, `EFI_NOT_FOUND`, **no jump** |
+
+A raw `Image` + appended FDTs is therefore **not** a valid analogue of
+`Image.gz-dtb` here, and it is exactly what a flashed image did on hardware:
+blank screen, straight into TWRP, our loader never ran. `dt_size == 0` is fine
+and the DTB set is unchanged — only the kernel slot had to change.
+
+The packer gzips the kernel argument with a **fixed mtime (0) and level 9**, so
+the same inputs give the same bytes; a kernel file that already starts with
+`1f 8b` is passed through instead of gzipped twice. `--no-gzip-kernel` exists
+for debugging and produces the non-booting layout. After packing it asserts
+that `d00dfeed` sits exactly at the end of the gzip member (a missing DTB set
+would otherwise silently produce a `DtbOffset` pointing at nothing).
+
+The DTBH path is deliberately untouched: there ABL locates the DTBs through the
+header's dt offset, so the kernel stays raw and the sweet-style flow is
+unchanged.
+
+#### The cmdline is the stock one
+
+The packer now **copies the template's cmdline verbatim** instead of zeroing it
+(`--cmdline STR` overrides it, `--empty-cmdline` restores the old behaviour).
+An empty cmdline is not a boot blocker — ABL synthesises most of what the
+kernel needs — but it loses the stock
+
+```
+msm_drm.dsi_display0=ss_dsi_panel_S6E3HA8_AMB577PX01_WQHD:config0
+```
+
+which is the token the loader reads out of `/chosen/bootargs` to choose the
+panel (`AMB577PX01` vs `AMB577MQ01`) and therefore the ELVSS byte. Our own
+boot-args still go into the payload cmdline (`tools/mkpayload.py`), and the
+loader keeps preferring that for `starq*` arguments.
+
+Confirmed against the phone's own pulled DT (`data/live.dtb`, gitignored): its
+`/chosen/bootargs` is the stock boot.img cmdline **as a literal prefix**
+(byte-identical), followed by ABL's own additions (`root=/dev/sda22`,
+`androidboot.serialno=…`, `msm_drm.dsi_display0=ss_dsi_panel_S6E3HA8_AMB577PX01_WQHD:`,
+`lcd_id=…`, …). So the header cmdline is exactly what ABL merges into
+`/chosen/bootargs`, and zeroing it drops `dsi_display0` from the tree the loader
+reads.
+
+**ABL picks one of the 15 FDTs by `qcom,board-id`/`qcom,msm-id` and passes it
 to the kernel in `x0`** — the same contract the sweet shim has, which is why
 `shim/starqltechn/start.S` and `loader.c` need no change for this shape: they read
 `/chosen/linux,initrd-start`, `/chosen/bootargs` etc. out of whatever tree arrived
@@ -232,11 +289,14 @@ Measured artifacts on a Linux host (real kernel from CI, real stock image
 | `kernel.development.starqltechn` (CI run 39611433630) | 17,172,688 bytes |
 | payload (`mkpayload.py`) | 16,596,320 bytes |
 | `shim/out/Image` (loader, arm64 Linux header, magic `ARMd` at `0x38`) | 56,384 bytes |
-| `starq-ios-boot.img` (loader `Image` + 15 stock DTBs, 64 MiB partition) | 27,828,224 bytes |
+| `starq-ios-boot.img` (`Image.gz` 10,347 B + 15 stock DTBs, 64 MiB partition) | 27,783,168 bytes |
 
-The boot image leaves 39,280,640 bytes of the partition unused; its header differs
-from the template only in `kernel_size` and `ramdisk_size` (`dt_size` stays 0,
-`os_version`/`kernel_addr`/`ramdisk_addr`/`tags_addr` unchanged).
+The kernel slot is **11,175,665 bytes** = gzip 10,347 B (from the 56,384-byte
+`Image`) + the 11,165,318-byte DTB set, with `d00dfeed` at slot `0x286b`, i.e.
+exactly at the end of the gzip member. The boot image leaves 39,325,696 bytes of
+the partition unused; its header differs from the template only in `kernel_size`,
+`ramdisk_size` and the `id` (`dt_size` stays 0, and `os_version`/addresses/cmdline
+are byte-identical).
 
 The loader can be built and packed on its own, without the kernel pipeline:
 
@@ -343,7 +403,7 @@ of the display work. Stand at the phone, do not film — the pattern is static:
    the TWRP path needs `adb reboot`), watch the panel. Four 64-line bands (white,
    red, green, blue) at the top, then the loader's console text, then a magenta
    block with a cyan square.
-2. **Bands and block visible** -> S-Boot left MDSS scanning out of `0x9d400000`.
+2. **Bands and block visible** -> ABL left MDSS scanning out of `0x9d400000`.
    Record it and stop worrying about display: the sweet CPU-copy path transfers.
 3. **Samsung logo, black or garbage** -> command-mode panel with its own GRAM.
    Nothing the loader writes reaches it; MDSS/DSI has to be programmed before any
@@ -407,8 +467,8 @@ Odin. If `userdata` was overwritten with the iOS root, format it in TWRP.
   paths. The cross build does now succeed on the dev host (`gcc-aarch64-linux-gnu`
   from apt, 56,384-byte Image), but a successful link only proves the code
   compiles and fits; every MMIO address in it is still unproven.
-- **Which of the 15 appended DTBs does S-Boot pick?** The stock `Image.gz-dtb`
-  carries one FDT per `qcom,board-id` (`(0x8, 0x2)` … `(0x8, 0xe)`) and S-Boot
+- **Which of the 15 appended DTBs does ABL pick?** The stock `Image.gz-dtb`
+  carries one FDT per `qcom,board-id` (`(0x8, 0x2)` … `(0x8, 0xe)`) and ABL
   passes the matching one to the kernel in `x0`, but the boot image does not
   record which one it selected. This phone's board-id is in the live DTB
   (`qcom,board-id = <0x08 0x08>` in the first entry), yet the actual selection
@@ -425,15 +485,16 @@ Odin. If `userdata` was overwritten with the iOS root, format it in TWRP.
 ## The loader: `shim/starqltechn/`
 
 `shim/build.sh BOARD=starqltechn` no longer builds the Qualcomm ABL shim
-(`shim.c`/`mmu.c`/`ufs.c`): S-Boot behaves like a Linux bootloader, not like
-ABL, so the board has its own entry point, link script and loader. `BOARD=sweet`
-is untouched and still produces the same `mkbootimg` command line.
+(`shim.c`/`mmu.c`/`ufs.c`): ABL hands our kernel control the Linux way (EL1, MMU
+off, `x0` = DTB) rather than as an ABL app, so the board has its own entry point,
+link script and loader. `BOARD=sweet` is untouched and still produces the same
+`mkbootimg` command line.
 
 | File | What it is |
 | --- | --- |
-| `start.S` | arm64 Linux Image header + entry. EL1, MMU and caches off, `x0` = DTB (S-Boot's contract). Position independent; passes its own run-time load address to C so the loader can tell whether zeroing XNU's RAM would erase itself. |
+| `start.S` | arm64 Linux Image header + entry. EL1, MMU and caches off, `x0` = DTB (ABL's contract). Position independent; passes its own run-time load address to C so the loader can tell whether zeroing XNU's RAM would erase itself. |
 | `loader.ld` | Linked at 0, 32 KiB stack after `.bss`, no secondary stacks. |
-| `loader.c` | The S-Boot-specific loader (see below). |
+| `loader.c` | The ABL-specific loader (see below). |
 | `dsi.c` | DSI0 command-DMA transmit (`starq_dsi_dcs_write`), the panel probe from `/chosen/bootargs`, the `starqelvss=`/`starqmps=` parsers, the panel-aware default sequence and the read-only `DSI_CTRL` mode probe. See "Panel ELVSS override over DSI" above. |
 | `build.sh` | Compile + optional pack. `build.sh STOCK_BOOT.img PAYLOAD.bin OUT.img [DTB.bin|FDT_DIR]`, packed by `tools/starq_mkboot.py`, so `mkbootimg` is not needed. It probes the stock shape itself and substitutes the right section (`--dtb` for a DTBH template, `--dtb-set` for `Image.gz-dtb`); the argument is optional. |
 | `Makefile` | `make -C shim/starqltechn` builds and runs the host test. |
@@ -464,7 +525,7 @@ is untouched and still produces the same `mkbootimg` command line.
    the framebuffer, the ramoops region and the DTB must all be outside the XNU
    window.
 7. **Zeroes `phys_base..phys_base+mem_size`.** This is the S8's hard-won step:
-   S-Boot leaves the previous OS's RAM in place, and XNU hung in
+   ABL leaves the previous OS's RAM in place, and XNU hung in
    `vm_mem_bootstrap` on the S8 depending on how the phone had been rebooted.
 8. Copies each segment, zeroes the `vmsize - file_size` tail, cleans to PoC.
 9. Writes the ADT at `kernel_end`, `boot_args` on the next page boundary,
@@ -545,7 +606,7 @@ DTS:
 | `AMB577MQ01` | `b5 19 dc 0a` | 0x19 | 0xdc | **0x0a** | `b5 8f dc 0a` |
 
 So it cannot be a constant. **Detection is free of risk and needs no register
-access**: S-Boot's own command line lives in the DTB's `/chosen/bootargs` and the
+access**: the bootloader's command line lives in the DTB's `/chosen/bootargs` and the
 vendor display driver names the panel in it,
 
 ```
@@ -572,7 +633,7 @@ before the first register access, so the read-only `DSI_CTRL` mode probe is
 skipped too and not one DSI register is read or written. That is the point of
 the switch — a read of an **unclocked** MDSS block can hang Qualcomm's
 interconnect, which costs an Odin flash to recover — so it must not depend on
-S-Boot having left MDSS clocked. The log says which switch fired and what it
+ABL having left MDSS clocked. The log says which switch fired and what it
 guarantees:
 
 ```

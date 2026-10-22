@@ -1,15 +1,16 @@
 #!/bin/bash
-# Build the Galaxy S9 (starqltechn, SM-G9600) S-Boot XNU loader: the "kernel"
-# section of a Samsung boot.img v0.
+# Build the Galaxy S9 (starqltechn, SM-G9600) XNU loader: the "kernel" section
+# of a Samsung boot.img v0, loaded by the phone's Qualcomm ABL.
 #
 #   shim/starqltechn/build.sh                              compile only
-#   shim/starqltechn/build.sh STOCK_BOOT.img PAYLOAD.bin OUT.img [DTBH.bin]
+#   shim/starqltechn/build.sh STOCK_BOOT.img PAYLOAD.bin OUT.img [DTBH.bin|FDT_DIR]
 #
 # STOCK_BOOT.img is the phone's own boot image (backup/starq/boot.img): it
-# supplies the header S-Boot/AVB expect and the Qualcomm DTBH dt section.
-# PAYLOAD.bin is tools/mkpayload.py's SWEETXNU v1 container. The packer is
-# tools/starq_mkboot.py, so no mkbootimg is needed (Samsung's header is not an
-# mkbootimg layout).
+# supplies the header ABL/AVB expect and the DTBs (a Qualcomm DTBH dt section,
+# or, for the starqltechn stock image, FDTs appended after the kernel's gzip
+# stream -- the packer handles both). PAYLOAD.bin is tools/mkpayload.py's
+# SWEETXNU v1 container. The packer is tools/starq_mkboot.py, so no mkbootimg is
+# needed (Samsung's header is not an mkbootimg layout).
 #
 # Environment:
 #   OUT_DIR=dir   object/output directory (default <here>/out). shim/build.sh
@@ -24,7 +25,7 @@ OBJCOPY=aarch64-linux-gnu-objcopy
 NM=aarch64-linux-gnu-nm
 READELF=aarch64-linux-gnu-readelf
 # Same flag set as the S8 port (ios-galaxy-s8 shim/dreamlte/build.sh):
-# -march=armv8-a keeps the image runnable on whichever core S-Boot used,
+# -march=armv8-a keeps the image runnable on whichever core ABL used,
 # -fno-tree-loop-distribute-patterns stops gcc turning the copy/zero loops into
 # calls that expect a libc, and -Werror is on because a warning in a
 # freestanding loader is a bug.
@@ -43,7 +44,7 @@ for f in start.S loader.c dsi.c ../fdt.c; do
 	objs="$objs $o"
 done
 
-# The image runs wherever S-Boot placed it, with no relocation pass. The Linux
+# The image runs wherever ABL placed it, with no relocation pass. The Linux
 # Image header at the start of .text.head is the one place a link-time address
 # may appear (image_size = _end, linked at 0), exactly as in the sweet shim; a
 # relocation anywhere else means the image would only work at its link address.
@@ -57,7 +58,7 @@ $CC $CFLAGS -static -T "$here/loader.ld" -Wl,--build-id=none -Wl,--no-warn-rwx-s
 	$objs -o "$OUT/starq-loader.elf"
 $OBJCOPY -O binary "$OUT/starq-loader.elf" "$OUT/Image"
 # Pad to _end so .bss and the stack exist as zeroed bytes in the file: nothing
-# else writes them, and S-Boot copies only image_size bytes.
+# else writes them, and ABL copies only image_size bytes.
 size=$($NM "$OUT/starq-loader.elf" | awk '$3=="_end"{print strtonum("0x"$1)}')
 [ -n "$size" ] || { echo "error: no _end symbol in the loader elf" >&2; exit 1; }
 truncate -s "$size" "$OUT/Image"
@@ -69,7 +70,8 @@ if [ $# -eq 3 ]; then
 elif [ $# -eq 4 ]; then
 	# Substitute the stock DTBs: a DTBH table when the stock image has a dt
 	# section, an FDT set when it is Image.gz-dtb. The packer probes the shape
-	# and rejects the wrong flag with an explanation.
+	# and rejects the wrong flag with an explanation. It also gzips our Image in
+	# the second case -- ABL needs the gzip member to locate the DTBs.
 	if [ "$(python3 "$here/../../tools/starq_mkboot.py" --shape "$1")" = appended ]; then
 		flag=--dtb-set
 	else
