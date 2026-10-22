@@ -1,16 +1,17 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * Galaxy S9 (SM-G9600 / SC-02K, "starqltechn", Qualcomm SDM845) XNU loader.
  *
- * Samsung's S-Boot is not Qualcomm's ABL kernel-boot contract, even on a
- * Qualcomm SoC: it behaves like a Linux bootloader. It loads the BOOT image's
- * kernel section at the header's kernel_addr, enters at EL1 with the MMU and
- * caches off with x0 = DTB, and hands the ramdisk over through
- * /chosen/linux,initrd-{start,end} (established on the S8, whose S-Boot the S9
- * one descends from; still to be confirmed on this phone). The ramdisk holds a
+ * The bootloader on this phone is Qualcomm **ABL** (`bota` carries `abl.elf`),
+ * as on sweet. Here it boots the kernel slot of a Samsung boot.img the way a
+ * Linux bootloader would: it loads it at the header's kernel_addr, enters at
+ * EL1 with the MMU and caches off with x0 = DTB, and hands the ramdisk over
+ * through /chosen/linux,initrd-{start,end}. (The S8 reference port this file
+ * descends from ran on Samsung's Exynos S-Boot, which uses the same Android
+ * boot.img contract - that is why the shape transferred.) The ramdisk holds a
  * tools/mkpayload.py "SWEETXNU" v1 container (Mach-O segments, ADT, boot-args),
- * the same format the sweet shim consumes, so this file is the ABL -> S-Boot
- * translation layer: find the payload, validate it, zero the RAM window XNU is
- * about to own, copy the segments, build boot_args and jump.
+ * the same format the sweet shim consumes, so this file is the ABL ->
+ * boot_args translation layer: find the payload, validate it, zero the RAM
+ * window XNU is about to own, copy the segments, build boot_args and jump.
  *
  * Ported from Floppikrob/ios-galaxy-s8 shim/dreamlte/loader.c (Exynos 8895,
  * reaches the iOS lock screen). Everything Exynos is gone:
@@ -18,10 +19,10 @@
  *   - the PMIC/MUIC RTC read and the "s8rtc=" boot-arg (SPMI PM8998 here, and
  *     patch 0124 that consumes it does not exist in this tree),
  *   - the ufs/smp/touch/pmic/display probes and the 2 GiB high-bank DMA target.
- * Kept, because it is the part that makes S-Boot safe:
+ * Kept, because it is the part that makes the hand-off safe:
  *   - the whole validation chain (payload magic/version, segment bounds, the
  *     phys_base window, entry inside the kernel),
- *   - zeroing the XNU RAM window (S-Boot leaves the previous OS's RAM behind;
+ *   - zeroing the XNU RAM window (ABL leaves the previous OS's RAM behind;
  *     XNU hung in vm_mem_bootstrap on the S8 depending on how the phone had
  *     been rebooted, which is why the S8 port zeroes it),
  *   - the dual-zone ramoops log, for the same forced-reboot-corrupts-a-header
@@ -31,7 +32,7 @@
  *   starqfb=0          do not paint the framebuffer test pattern
  *   starqfb=1          paint it even when built with STARQ_FB_TEST=0
  *   starqwin=BASE:SIZE accept a different XNU RAM window (hex, ": " separated),
- *                      e.g. starqwin=0xA2000000:0x18000000. Only the accepted
+ *                      e.g. starqwin=0xD4000000:0x2B000000. Only the accepted
  *                      window changes: the payload's phys_base/mem_size from
  *                      the ADT stay authoritative for the copies.
  *   starqelvss=LIST    override the panel ELVSS write. LIST is a DCS hex list,
@@ -110,19 +111,39 @@
 #endif
 #define PRZ_SIG			0x43474244U	/* "DBGC" */
 
-/* The RAM window this board is allowed to hand to XNU: Samsung's largest free
- * gap in the 4 GB low bank (0xa1c01000..0xba000000 in the vendor
- * reserved-memory map), and the address postmarketOS loads its initramfs at on
- * this exact device. Must match tools/starq-boot.sh's RAM_BASE/RAM_SIZE and
- * therefore the ADT + the payload's phys_base/mem_size. */
+/* The RAM window this board is allowed to hand to XNU.
+ *
+ * 0xd4000000 + 0x2b000000 (688 MiB) is the second-largest free gap in the live
+ * DTB's reserved-memory map, and the only one big enough that is also clear of
+ * everything the bootloader leaves behind. Measured, not guessed:
+ *
+ *   below  camera_mem_region   0xc0000000 + 0x14000000, ends at 0xd4000000
+ *   above  qseecom_ta_region   0xff000000 + 0x01000000, starts at 0xff000000
+ *
+ * so the window is exactly bounded by two carve-outs and ends at 0xff000000.
+ * Clear of:
+ *   - the payload: ABL puts the BOOT ramdisk at 0xa2000000
+ *     (/chosen/linux,initrd-{start,end}, 0xa2000000..0xa2fd3df0 on hardware,
+ *     0xfd3df0 = 15.8 MiB, ending well below 0xd4000000) - the previous window,
+ *     0xa2000000 + 0x18000000, *started on* that ramdisk, which is exactly the
+ *     collision the loader's overlap check reported and refused to boot,
+ *   - the framebuffer   cont_splash_region 0x9d400000 + 0x2400000,
+ *   - ramoops           0xa1300000 + 0x100000.
+ *
+ * The largest gap (0xa1c01000 + 0x1e3ff000, 483 MiB) is NOT usable: the payload
+ * sits in the middle of it.
+ *
+ * Must match tools/mkadt.py's BOARDS['starqltechn'] dram_base/dram_size and
+ * tools/starq-boot.sh's RAM_BASE/RAM_SIZE, i.e. the ADT and the payload's
+ * phys_base/mem_size. */
 #ifndef XNU_RAM_BASE
-#define XNU_RAM_BASE		0xa2000000UL
+#define XNU_RAM_BASE		0xd4000000UL
 #endif
 #ifndef XNU_RAM_SIZE
-#define XNU_RAM_SIZE		0x18000000UL
+#define XNU_RAM_SIZE		0x2b000000UL
 #endif
 
-/* S-Boot puts the BOOT ramdisk in the low 4 GB bank; only 0x80000000..4G is
+/* ABL puts the BOOT ramdisk in the low 4 GB bank; only 0x80000000..4G is
  * DRAM on this board. */
 #ifndef LOW_RAM_BASE
 #define LOW_RAM_BASE		0x80000000UL
@@ -166,10 +187,16 @@
 #define STARQ_ELVSS_MPS_DEFAULT	STARQ_ELVSS_MPS
 #endif
 
-/* /chosen/bootargs is S-Boot's Linux command line; a few hundred bytes are
- * typical, and the panel token is ~64. Sized for the log, not for the longest
- * possible string. */
-#define STARQ_BOOTARGS_MAX	512
+/* /chosen/bootargs is ABL's merged Linux command line: the stock boot.img
+ * cmdline plus ABL's own additions (root=, androidboot.serialno=, ... and last
+ * msm_drm.dsi_display0=<panel>:). It is LONG: the live DTB on this SC-38 carries
+ * 1793 bytes, and the panel token - the one thing the loader needs from it -
+ * comes after ABL's additions, i.e. near the end. A 512-byte buffer truncated
+ * it mid-token ("... msm_drm.dsi_di") and the panel probe then answered
+ * UNKNOWN on real hardware. 2048 covers this phone's full line with margin;
+ * fdt_chosen_str() truncates (and terminates) rather than overrunning if a
+ * future bootloader line is longer still. */
+#define STARQ_BOOTARGS_MAX	2048
 #define STARQ_PANEL_TOKEN_MAX	96
 
 /* Cache maintenance and barriers mean nothing on the host, where
@@ -519,10 +546,10 @@ static int windows_overlap(uintptr_t a, uint64_t alen, uint64_t base, uint64_t s
 
 uint64_t starq_boot_args;	/* read by start.S */
 
-/* load/len: where S-Boot actually put this image and how big it is, computed
+/* load/len: where ABL actually put this image and how big it is, computed
  * PC-relatively by start.S. The image is linked at 0 and runs wherever it was
  * loaded, so the link-time address of _head (0) cannot be used to tell whether
- * the loader overlaps the RAM window S-Boot is about to have zeroed. */
+ * the loader overlaps the RAM window XNU is about to own. */
 uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr,
 		 uintptr_t load, uint64_t len)
 {
@@ -533,7 +560,7 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr,
 	log_len = log2_len = 0;
 	fill(0, 0, FB_W, FB_H, 0xff000000U);
 	fg = 0xffffff00U;
-	out("S9LOADER BEGIN  (starqltechn S-Boot XNU loader)\n");
+	out("S9LOADER BEGIN  (starqltechn ABL XNU loader)\n");
 	fg = 0xffffffffU;
 	kv("EL", el);
 	kv("SCTLR", sctlr);
@@ -561,7 +588,7 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr,
 	 * is the answer to "which of the two S9 panels is in this unit" for
 	 * every later step and for the log if the boot fails from here on.
 	 *
-	 * The identity comes from the DTB's /chosen/bootargs - S-Boot's own
+	 * The identity comes from the DTB's /chosen/bootargs - ABL's own merged
 	 * command line, not our payload cmdline - because that is where the
 	 * vendor display driver reads msm_drm.dsi_display0=<panel node>:config0
 	 * (dsi_display.c:7061-7064). The payload cmdline says nothing about the
@@ -599,7 +626,7 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr,
 	}
 	out("\n");
 
-	/* S-Boot puts the BOOT ramdisk in the low 4 GB bank; only 0x80000000..4G is
+	/* ABL puts the BOOT ramdisk in the low 4 GB bank; only 0x80000000..4G is
 	 * DRAM on this board. */
 	uint64_t rd_start, rd_end;
 	if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
@@ -661,7 +688,7 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr,
 	if (dtb >= p->phys_base && dtb < mem_end)
 		return fail("DTB inside the XNU RAM window");
 
-	/* S-Boot hands XNU the previous OS's RAM (TWRP's Linux after `adb
+	/* ABL hands XNU the previous OS's RAM (TWRP's Linux after `adb
 	 * reboot`, partly decayed after a forced reboot); XNU 6 hung in
 	 * vm_mem_bootstrap on the S8 until this window was zeroed. */
 	out("zeroing XNU RAM...\n");
@@ -725,7 +752,7 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr,
 	}
 	out("\n");
 
-	/* Step: the DSI mode probe, then the ELVSS override. S-Boot leaves the
+	/* Step: the DSI mode probe, then the ELVSS override. ABL leaves the
 	 * DSI link up, so the panel's own registers can be written without an
 	 * MDSS driver; see dsi.c for the register sequence and what is
 	 * deliberately left alone.

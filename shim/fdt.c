@@ -23,9 +23,10 @@
 
 /*
  * Byte-wise big-endian load. It must not be a plain u32 load: with the MMU off
- * everything is Device memory and an unaligned u32 access faults. The FDT S-Boot
- * hands us need not be 4-byte aligned -- in an Image.gz-dtb the DTBs are an
- * unpadded cat, so member #2 of the stock starqltechn set starts at 0xb5c9d.
+ * everything is Device memory and an unaligned u32 access faults. The FDT the
+ * bootloader hands us need not be 4-byte aligned -- in an Image.gz-dtb the
+ * DTBs are an unpadded cat, so member #2 of the stock starqltechn set starts
+ * at 0xb5c9d.
  */
 static uint32_t be32(uintptr_t a)
 {

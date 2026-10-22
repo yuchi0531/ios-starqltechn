@@ -1,5 +1,5 @@
 /*
- * starqltechn loader: linked at 0, runs wherever S-Boot placed the kernel
+ * starqltechn loader: linked at 0, runs wherever ABL placed the kernel
  * section. Same layout as the S8 port's loader.ld, minus the secondary-stack
  * area (this loader starts no other cores).
  */

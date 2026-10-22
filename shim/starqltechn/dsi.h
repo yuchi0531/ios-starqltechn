@@ -4,7 +4,7 @@
 /*
  * SDM845 DSI0 command-path TX (Galaxy S9, "starqltechn").
  *
- * S-Boot leaves MDSS, DSI0 and the S6E3HA8 panel powered and PLL-locked. What
+ * ABL leaves MDSS, DSI0 and the S6E3HA8 panel powered and PLL-locked. What
  * mode the panel is in is NOT assumed here: the vendor DTS declares both S9
  * panels dsi_cmd_mode (dtsi_px01.dtsi:70, dtsi_mq01.dtsi:66), which is why
  * starq_dsi_init() logs DSI_CTRL's enable/video/command bits and this code
@@ -42,7 +42,7 @@
  * physical address the DSI DMA engine reads; we must not program the MDSS
  * SMMU, so it has to be memory the display pipeline already has mapped --
  * i.e. inside the bootloader framebuffer reservation ("framebuffer_mem",
- * 0x9d400000 + 0x02400000, the only region S-Boot mapped for MDSS). The
+ * 0x9d400000 + 0x02400000, the only region ABL mapped for MDSS). The
  * visible panel area is the first 1440*2960*4 = 0x1042800 bytes, so the last
  * page is outside anything the test pattern or XNU's console touches.
  */
@@ -81,7 +81,7 @@ int starq_dcs_parse(const char *s, struct starq_dcs_seq *out);
 
 /*
  * Which panel the bootloader configured, from the DTB's /chosen/bootargs:
- * S-Boot passes its Linux command line there and the vendor display driver
+ * ABL puts its merged Linux command line there and the vendor display driver
  * names the panel in it, e.g.
  *   msm_drm.dsi_display0=ss_dsi_panel_S6E3HA8_AMB577PX01_WQHD:config0
  * (dsi_display.c:7061-7064, matched against panel->name in

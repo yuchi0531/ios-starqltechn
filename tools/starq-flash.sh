@@ -143,7 +143,7 @@ cmd_pull_log() {
 	# pstore survives the reboot TWRP did after the crash: the bootloader's
 	# ramoops region is what the previous boot left behind. console-ramoops-0 is
 	# the console (shim text + XNU kprintf), pmsg-ramoops-0 is the loader's own
-	# messages (S-Boot does not write here, our shim does).
+	# messages (ABL does not write here, our shim does).
 	local ts; ts=$(date +%Y%m%d-%H%M%S)
 	mkdir -p "$(dirname "$out")"
 	local base=${out%.txt}

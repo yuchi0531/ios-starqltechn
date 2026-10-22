@@ -4,16 +4,19 @@ End-to-end procedure for the Samsung Galaxy S9 with the Qualcomm SDM845 — the
 `starqltechn` board in `tools/mkadt.py`. **This is a Qualcomm ABL phone**
 (`bota` carries `abl.elf`), not an Exynos S-Boot one, and that decides the
 `boot.img` layout: the kernel slot must be a gzip stream with the DTBs right
-after it. Nothing here has run on hardware as of 2026-10-22: the kernel builds in
-CI (`xnu-kernel` artifact, 17,172,688-byte `kernel.development.starqltechn`) and
-the whole chain from Mach-O to a Samsung `boot.img` runs on a Linux host against
-the phone's **own** pulled boot partition (`data/boot.emmc.win.img`, gitignored;
-see step 2): 56,384-byte loader `Image`, 27,783,168-byte `starq-ios-boot.img`
-with the stock header and cmdline, our `Image.gz` + the stock `Image.gz-dtb` DTB
-set and a recomputed kernel SHA-1. A first image with a *raw* kernel slot was
-flashed on hardware and did not boot (see "The gzip stream is mandatory on
-ABL"). The phone side of the fixed image is written and unrun. Everything that
-needs the phone is in "What is still open".
+after it. **The loader now runs on the phone and draws on the panel.** Getting
+there took two hardware findings: a *raw* kernel slot does not boot at all (see
+"The gzip stream is mandatory on ABL"), and, once it drew, two more bugs that
+showed up in the loader's own log - a 512-byte `/chosen/bootargs` buffer that
+truncated the panel token (`panel=UNKNOWN`), and an XNU RAM window that began
+exactly on the payload ABL loads at `0xa2000000` (see "What is still open"). Both
+are fixed. The kernel builds in CI (`xnu-kernel` artifact, 17,172,688-byte
+`kernel.development.starqltechn`) and the whole chain from Mach-O to a Samsung
+`boot.img` runs on a Linux host against the phone's **own** pulled boot partition
+(`data/boot.emmc.win.img`, gitignored; see step 2): 56,384-byte loader `Image`,
+27,783,168-byte `starq-ios-boot.img` with the stock header and cmdline, our
+`Image.gz` + the stock `Image.gz-dtb` DTB set and a recomputed kernel SHA-1.
+Everything that still needs the phone is in "What is still open".
 
 ## Reference ports
 
@@ -137,7 +140,7 @@ That runs, in order:
 
 | Step | Tool |
 | --- | --- |
-| ADT for this board, RAM `0xa2000000 + 0x18000000` | `tools/mkadt.py --board starqltechn` |
+| ADT for this board, RAM `0xd4000000 + 0x2b000000` | `tools/mkadt.py --board starqltechn` |
 | payload (kernel segments + ADT + boot-args) | `tools/mkpayload.py` |
 | loader compile (`shim/starqltechn/`) | `shim/build.sh` with `BOARD=starqltechn`, `PACK=0` |
 | boot.img v0 pack | `tools/starq_mkboot.py` |
@@ -430,15 +433,21 @@ Odin. If `userdata` was overwritten with the iOS root, format it in TWRP.
 
 ## What is still open
 
-- The RAM window `0xa2000000 + 0x18000000` is the **largest free gap in the low
-  4 GB bank** of the live DTB's `reserved-memory` (`0xa1c01000 + 0x183ff000`,
-  388 MiB), bounded below by `sec_debug_autocomment` (ends `0xa1c01000`) and
-  ending exactly at `0xba000000`, the start of `modem_shared_mem_region`. It was
-  a guess (postmarketOS loads its initramfs at `0xa2000000`) that the pulled DT
-  confirmed. The loader and `tools/starq-boot.sh` both hardcode it; `starqwin=BASE:SIZE`
-  on the boot-args overrides it for the loader's check without a rebuild.
-- `tools/mkadt.py` still marks `starqltechn` provisional; passing
-  `--ram-base/--ram-size` (which `starq-boot.sh` does) silences its warning.
+- The RAM window is **`0xd4000000 + 0x2b000000` (688 MiB, ends
+  `0xff000000`)**, measured from this phone's live DTB `reserved-memory`:
+  bounded below by `camera_mem_region` (`0xc0000000 + 0x14000000`, ends exactly
+  at `0xd4000000`) and above by `qseecom_ta_region` (`0xff000000 + 0x1000000`).
+  It is clear of the framebuffer (`0x9d400000`), `ramoops` (`0xa1300000`) and
+  the BOOT ramdisk ABL loads at `0xa2000000` (`…0xa2fd3df0`, `0xfd3df0` = 15.8 MiB).
+
+  The **largest** gap (`0xa1c01000 + 0x1e3ff000`, 483 MiB) is not usable: the
+  payload sits inside it. The previous window `0xa2000000 + 0x18000000`
+  (384 MiB) started exactly on the ramdisk, and on hardware the loader's
+  overlap check correctly refused to boot ("payload sits inside the XNU RAM
+  window"). The check is right; the window moved. The loader,
+  `tools/mkadt.py`'s `BOARDS['starqltechn']` and `tools/starq-boot.sh` all
+  hardcode it; `starqwin=BASE:SIZE` on the boot-args overrides it for the
+  loader's check without a rebuild.
 - Framebuffer address and panel geometry (`0x9d400000`, 1440×2960) match the live
   DTB's `cont_splash_region` (`0x9d400000`, size `0x2400000`); the geometry itself
   is still mainline's.
@@ -515,10 +524,13 @@ link script and loader. `BOARD=sweet` is untouched and still produces the same
    it runs before the payload is validated so the answer is in the log even if
    the boot fails later. Its lines are prefixed `STARQ panel:`, not `STARQ
    DSI:`, because it is string parsing and stays on even when the DSI path is
-   switched off (step 10).
+   switched off (step 10). The buffer is **2048 bytes**: ABL's merged line is
+   1793 bytes here and ends with the panel token, and a 512-byte buffer used to
+   cut it mid-token (`panel=UNKNOWN` on hardware). A longer line is truncated
+   and terminated by `fdt_chosen_str()`, never overrun.
 5. Validates the SWEETXNU v1 payload: magic, version, `nsegs` (1..32), the
    segment table inside the ramdisk, `adt_off`/`adt_size` inside the ramdisk,
-   `phys_base`+`mem_size` inside `0xa2000000 + 0x18000000`, `entry_va` and
+   `phys_base`+`mem_size` inside `0xd4000000 + 0x2b000000`, `entry_va` and
    `kernel_end` at or above `virt_base`, and every segment inside the RAM
    window.
 6. Refuses to zero RAM it still needs: the payload, the loader image itself,

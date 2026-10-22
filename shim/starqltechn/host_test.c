@@ -2,22 +2,26 @@
  * Run the starqltechn loader on the host.
  *
  * There is no aarch64 cross compiler on a plain desktop and no emulator for
- * S-Boot, so this is the only way shim/starqltechn/loader.c gets executed
- * before it runs on a phone. loader.c has no dependency on a running kernel -
- * it only reads and writes physical addresses and does cache maintenance - and
- * its cache/barrier ops compile away off aarch64. So: mmap the real board
- * addresses (framebuffer, ramoops, low RAM, the XNU RAM window), build a
- * synthetic SWEETXNU payload in the initrd slot and a real flattened device
- * tree with /chosen/linux,initrd-*, and call dl_main() like start.S does.
+ * anything at EL1, so this is the only way shim/starqltechn/loader.c gets
+ * executed before it runs on a phone. loader.c has no dependency on a running
+ * kernel - it only reads and writes physical addresses and does cache
+ * maintenance - and its cache/barrier ops compile away off aarch64. So: mmap
+ * the real board addresses (framebuffer, ramoops, the low-RAM initrd slot, the
+ * ramdisk ABL uses and the XNU RAM window), build a synthetic SWEETXNU payload
+ * in the initrd slot and a real flattened device tree with
+ * /chosen/linux,initrd-*, and call dl_main() like start.S does.
  *
  *   make -C shim/starqltechn host
  *
  * The constants under test are the loader's own defaults: nothing here
  * redefines FB_BASE, XNU_RAM_BASE, RAMOOPS_* or the test pattern.
  *
- * What this cannot prove: that S-Boot enters at the image start, that the panel
- * scans out of FB_BASE, that 0xa2000000+0x18000000 is free on this phone, or
- * that fs/pstore parses the header we write. Those need the hardware.
+ * What this cannot prove: that ABL enters at the image start, that the panel
+ * scans out of FB_BASE, that 0xd4000000+0x2b000000 is free of every carve-out on
+ * this phone, or that fs/pstore parses the header we write. Those need the
+ * hardware. What it does prove is the arithmetic: the window and the addresses
+ * ABL really uses (framebuffer, ramoops, the ramdisk at 0xa2000000) do not
+ * overlap.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,13 +40,21 @@
 #define T_FB_SIZE	0x2400000UL
 #define T_RAMOOPS	0xa1300000UL
 #define T_RAMOOPS_SIZE	0x100000UL
-#define T_XNU_BASE	0xa2000000UL
-#define T_XNU_SIZE	0x18000000UL
+#define T_XNU_BASE	0xd4000000UL
+#define T_XNU_SIZE	0x2b000000UL
 
 #define T_RD		(T_LOW_BASE + 0x10000000UL)	/* 0x90000000 */
 #define T_RD_SIZE	0x200000UL
 #define T_XNU_WIN	0x200000UL			/* payload mem_size: small, so
 							 * zeroing it in the test is cheap */
+
+/* Where ABL actually puts the BOOT ramdisk on this phone: /chosen/
+ * linux,initrd-{start,end} read 0xa2000000..0xa2fd3df0 in the live DTB, and a
+ * boot log from hardware shows the same (initrd=0xa2000000 end=0xa2fd3df0,
+ * 0xfd3df0 = 15.8 MiB). The XNU window must not touch it - that collision is what
+ * stopped the first real boot. */
+#define T_ABL_RD	0xa2000000UL
+#define T_ABL_RD_SIZE	0x200000UL
 
 /* DSI0: the test gives the driver a register file instead of the real
  * addresses (dsi.c's MMIO ops compile to array accesses on the host, the same
@@ -75,7 +87,7 @@ static void *map_pa(unsigned long pa, unsigned long size)
 
 /* ---- flattened device tree: root + /chosen/{bootargs,linux,initrd-*} ----
  *
- * The bootargs property is what S-Boot's own command line arrives in, and the
+ * The bootargs property is what ABL's merged command line arrives in, and the
  * panel probe reads it, so the test has to be able to put an arbitrary string
  * there - including a very long one, to prove the bounds checks hold. */
 #define S_INITRD_START	"linux,initrd-start"
@@ -147,8 +159,9 @@ static size_t build_fdt(unsigned char *buf, uint64_t rd_start, uint64_t rd_end)
 }
 
 /* Big enough for a long bootloader command line plus the tree's own strings:
- * the FDT bound checks are worth exercising with something that does not fit. */
-static unsigned char fdt[4096];
+ * the FDT bound checks are worth exercising with something that does not fit,
+ * and a real ABL line is 1793 bytes (so > 2048 must also be testable). */
+static unsigned char fdt[16384];
 
 /* ---- synthetic SWEETXNU v1 payload, as tools/mkpayload.py writes one ---- */
 #define VIRT_BASE	0xfffffff007004000ULL	/* __TEXT vmaddr, as a real kernel */
@@ -164,9 +177,10 @@ static uint64_t kernel_end_va(void)
 	return (VIRT_BASE + SEG1_OFF + SEG1_SIZE + 0x3fff) & ~0x3fffULL;
 }
 
-static void build_payload(uint64_t phys_base, uint64_t mem_size, const char *cmdline)
+static void build_payload_at(uint64_t rd, uint64_t phys_base, uint64_t mem_size,
+			     const char *cmdline)
 {
-	struct payload *p = (struct payload *)T_RD;
+	struct payload *p = (struct payload *)rd;
 	memset(p, 0, PAYLOAD_LEN);
 	memcpy(p->magic, "SWEETXNU", 8);
 	p->version = 1;
@@ -183,22 +197,27 @@ static void build_payload(uint64_t phys_base, uint64_t mem_size, const char *cmd
 	p->segs[0].vmsize = SEG0_SIZE;
 	p->segs[0].file_off = off;
 	p->segs[0].file_size = SEG0_SIZE;
-	memset((void *)(T_RD + off), 0x5a, SEG0_SIZE);
+	memset((void *)(rd + off), 0x5a, SEG0_SIZE);
 	off += SEG0_SIZE;
 	p->segs[1].vmaddr = VIRT_BASE + SEG1_OFF;
 	p->segs[1].vmsize = SEG1_SIZE;
 	p->segs[1].file_off = off;
 	p->segs[1].file_size = SEG1_SIZE;
-	memset((void *)(T_RD + off), 0xb4, SEG1_SIZE);
+	memset((void *)(rd + off), 0xb4, SEG1_SIZE);
 	off += SEG1_SIZE;
 	p->adt_off = off;
 	p->adt_size = ADT_SIZE;
-	memset((void *)(T_RD + off), 0xa7, ADT_SIZE);
+	memset((void *)(rd + off), 0xa7, ADT_SIZE);
+}
+
+static void build_payload(uint64_t phys_base, uint64_t mem_size, const char *cmdline)
+{
+	build_payload_at(T_RD, phys_base, mem_size, cmdline);
 }
 
 /* One boot attempt: payload + FDT, then dl_main like start.S calls it. The
- * loader image (load/len) is the initrd slot: it must be outside the window.
- * `bootargs` is what S-Boot leaves in /chosen/bootargs; NULL means "no such
+ * loader image (load/len) is put at T_RD: it must be outside the window too.
+ * `bootargs` is what ABL leaves in /chosen/bootargs; NULL means "no such
  * property" (the old behaviour, and the UNKNOWN-panel path). */
 static uint64_t boot_args(const char *cmdline, const char *bootargs,
 			  uint64_t phys_base, uint64_t mem_size,
@@ -230,6 +249,32 @@ static uint64_t boot_ok_args(const char *cmdline, const char *bootargs)
 			 T_RD + PAYLOAD_LEN);
 }
 
+/* One boot with the payload where ABL really puts it (0xa2000000) and the
+ * loader image at T_RD, i.e. the arrangement that failed on hardware. */
+static uint64_t boot_ok_abl_rd(const char *cmdline, const char *bootargs)
+{
+	build_payload_at(T_ABL_RD, T_XNU_BASE, T_XNU_WIN, cmdline);
+	build_fdt_args(fdt, T_ABL_RD, T_ABL_RD + PAYLOAD_LEN, bootargs);
+	memset((void *)T_FB_BASE, 0x11, 0x10000);
+	memset((void *)T_RAMOOPS, 0x00, 0x10000);
+	return dl_main((uintptr_t)fdt, 1, 0x30d00800UL, (uintptr_t)T_RD, 0x40000UL);
+}
+
+/* The loader's own test (it is static there, so the arithmetic is repeated). */
+static int overlaps(uint64_t a, uint64_t alen, uint64_t base, uint64_t size)
+{
+	return size && alen && a < base + size && base < a + alen;
+}
+
+/* fdt_chosen_str, but with the property built into a real FDT first: the reader
+ * must cope with a bootloader line of any length, including one longer than the
+ * caller's buffer. */
+static int chosen_str_fdt(const char *bootargs, char *buf, unsigned buflen)
+{
+	build_fdt_args(fdt, 0x90000000UL, 0x90100000UL, bootargs);
+	return fdt_chosen_str((uintptr_t)fdt, "bootargs", buf, buflen);
+}
+
 /* The bootloader line, as it looks on a real S9. */
 #define BA_PX01 "console=ttyMSM0 androidboot.bootloader=G9600ZHS9FQL1 " \
 		"msm_drm.dsi_display0=ss_dsi_panel_S6E3HA8_AMB577PX01_WQHD:config0 " \
@@ -240,6 +285,38 @@ static uint64_t boot_ok_args(const char *cmdline, const char *bootargs)
 		"msm_drm.dsi_display0=ss_dsi_panel_S6E3HA8_AMB577MQ01_WQHD:config0 " \
 		"androidboot.hardware=qcom"
 #define BA_NONE "console=ttyMSM0 androidboot.bootloader=G9600ZHS9FQL1"
+
+/*
+ * The line ABL really leaves in /chosen/bootargs, in shape: the stock boot.img
+ * cmdline as a literal prefix, ABL's own additions (root=, androidboot.serialno=,
+ * ...) after it, and the panel token LAST. On this SC-38 that property is 1793
+ * bytes (measured on data/live.dtb), so it is well past the old 512-byte buffer
+ * - which truncated it mid-token and made the panel probe answer UNKNOWN on
+ * hardware. `filler` is that line's own tokens.
+ */
+#define BA_FILLER \
+	"rcupdate.rcu_expedited=1 console=null androidboot.hardware=qcom " \
+	"video=vfb:640x400,bpp=32,memsize=3072000 msm_rtb.filter=0x237 " \
+	"ehci-hcd.park=3 lpm_levels.sleep_disabled=1 " \
+	"service_locator.enable=1 swiotlb=2048 androidboot.configfs=true " \
+	"androidboot.usbcontroller=a600000.dwc3 " \
+	"firmware_class.path=/vendor/firmware_mnt/image loop.max_part=7 " \
+	"buildvariant=userdebug root=/dev/sda22 " \
+	"androidboot.bootdevice=1d84000.ufshc " \
+	"androidboot.serialno=2c69dbb021017ece androidboot.baseband=sdm "
+
+/* at least `min` bytes of ABL-shaped line, panel token last */
+static char ba_long[8192];
+static const char *long_bootargs(const char *token, size_t min)
+{
+	ba_long[0] = 0;
+	while (strlen(ba_long) + strlen(BA_FILLER) < min)
+		strcat(ba_long, BA_FILLER);
+	strcat(ba_long, "msm_drm.dsi_display0=");
+	strcat(ba_long, token);
+	strcat(ba_long, " lcd_id=0x910443 androidboot.revision=15");
+	return ba_long;
+}
 
 /*
  * DSI_CTRL as a bootloaders leaves it. The vendor DTS says both S9 panels are
@@ -320,6 +397,7 @@ int main(void)
 	map_pa(T_FB_BASE, T_FB_SIZE);
 	map_pa(T_RAMOOPS, T_RAMOOPS_SIZE);
 	map_pa(T_XNU_BASE, T_XNU_SIZE);
+	map_pa(T_ABL_RD, T_ABL_RD_SIZE);
 
 	/* The test's idea of the board must match the loader's. */
 	printf("== constants\n");
@@ -433,6 +511,59 @@ int main(void)
 		check(dl_main((uintptr_t)empty, 1, 0, 0, 0) == 0, "missing /chosen initrd rejected");
 	}
 
+	printf("== the XNU window vs what ABL leaves behind\n");
+	{
+		/* Pure arithmetic first, so a wrong window fails here with the
+		 * numbers on screen instead of as a mystifying boot refusal. */
+		check(!overlaps(T_ABL_RD, T_ABL_RD_SIZE, T_XNU_BASE, T_XNU_SIZE),
+		      "the ABL ramdisk (%#lx) is outside the window (%#lx+%#lx)",
+		      (unsigned long)T_ABL_RD, (unsigned long)T_XNU_BASE,
+		      (unsigned long)T_XNU_SIZE);
+		check(!overlaps(T_FB_BASE, T_FB_SIZE, T_XNU_BASE, T_XNU_SIZE),
+		      "the framebuffer (%#lx) is outside the window",
+		      (unsigned long)T_FB_BASE);
+		check(!overlaps(T_RAMOOPS, T_RAMOOPS_SIZE, T_XNU_BASE, T_XNU_SIZE),
+		      "ramoops (%#lx) is outside the window", (unsigned long)T_RAMOOPS);
+		check(T_XNU_BASE + T_XNU_SIZE == 0xff000000UL,
+		      "the window ends exactly at qseecom_ta_region (%#lx)",
+		      (unsigned long)(T_XNU_BASE + T_XNU_SIZE));
+		check(T_XNU_SIZE == 0x2b000000UL, "688 MiB, not the old 384 MiB (%#lx)",
+		      (unsigned long)T_XNU_SIZE);
+		/* The old window: this is the bug, stated as arithmetic. It
+		 * started exactly on the ramdisk ABL loads. */
+		check(overlaps(T_ABL_RD, T_ABL_RD_SIZE, 0xa2000000UL, 0x18000000UL),
+		      "the OLD window 0xa2000000+0x18000000 did overlap the ramdisk");
+
+		/* ...and the same through dl_main, with the payload where ABL
+		 * actually puts it. This is the arrangement that failed on
+		 * hardware; it must boot now. */
+		entry = boot_ok_abl_rd("starqfb=0", BA_PX01);
+		check(entry == T_XNU_BASE + ENTRY_OFF,
+		      "payload at 0xa2000000 boots with the new window (entry %#lx)",
+		      (unsigned long)entry);
+		check(*(volatile uint64_t *)T_XNU_BASE == 0x5a5a5a5a5a5a5a5aULL,
+		      "and the segments landed in the window, not on the ramdisk");
+		/* the ramdisk itself is untouched by the zeroing */
+		check(*(volatile char *)T_ABL_RD == 'S',
+		      "the payload at 0xa2000000 was not zeroed (%c)",
+		      *(volatile char *)T_ABL_RD);
+
+		/* The lenient direction must stay closed: ask for the old window
+		 * on the boot-args, with the payload inside it, and the overlap
+		 * check must still refuse. Moving the window is the fix, not
+		 * weakening the check. */
+		{
+			build_payload_at(T_ABL_RD, T_ABL_RD, T_XNU_WIN,
+					 "starqfb=0 starqwin=0xa2000000:0x18000000");
+			build_fdt_args(fdt, T_ABL_RD, T_ABL_RD + PAYLOAD_LEN, BA_PX01);
+			check(dl_main((uintptr_t)fdt, 1, 0x30d00800UL,
+				      (uintptr_t)T_RD, 0x40000UL) == 0,
+			      "starqwin=0xa2000000 with the payload there is still refused");
+			check(log_has("payload sits inside the XNU RAM window"),
+			      "and the log names the overlap");
+		}
+	}
+
 	printf("== framebuffer test pattern\n");
 	memset((void *)T_FB_BASE, 0x11, T_FB_SIZE);
 	entry = boot_ok("starqfb=1");
@@ -451,7 +582,7 @@ int main(void)
 	printf("== boot-arg overrides\n");
 	check(boot_ok("starqwin=0x81000000:0x1000") == 0,
 	      "starqwin outside the payload rejected");
-	check(boot_ok("starqwin=0xa2000000:0x200000") != 0,
+	check(boot_ok("starqwin=0xd4000000:0x200000") != 0,
 	      "starqwin matching the payload accepted");
 
 	printf("== a lookalike boot-arg must not match\n");
@@ -478,9 +609,14 @@ int main(void)
 		const char *text = (const char *)0xa134000cUL;
 		check(memmem(text, len, "S9LOADER BEGIN", 14) != NULL, "header line logged");
 		check(memmem(text, len, "JUMP TO XNU", 11) != NULL, "jump line logged");
-		check(memmem(text, len, "phys=0xa2000000", 15) != NULL, "payload RAM logged");
+		check(memmem(text, len, "phys=0xd4000000", 15) != NULL, "payload RAM logged");
 		check(text[0] == 'S' && !memcmp(text, "S9LOADER BEGIN", 14),
 		      "text starts at zone+12 with the header line");
+		/* This board's bootloader is Qualcomm ABL, not an Exynos S-Boot:
+		 * the line on the panel must not claim otherwise. */
+		check(memmem(text, len, "starqltechn ABL XNU loader", 26) != NULL &&
+		      memmem(text, len, "S-Boot", 6) == NULL,
+		      "the header line says ABL, not S-Boot");
 		/* the zone must not run past its 0x40000 bytes */
 		check(len <= 0x40000 - 12, "log fits the zone (%u)", len);
 		/* the ftrace zone at 0xa13c0000 must be untouched */
@@ -519,9 +655,10 @@ int main(void)
 		      strcmp(tok, "con") == 0,
 		      "a short buffer truncates rather than overrunning");
 
-		/* An Image.gz-dtb appends the DTBs to the kernel as an unpadded cat,
-		 * so the tree S-Boot hands over can start at an odd address (the
-		 * stock starqltechn set has a member at 0xb5c9d). With the MMU off
+		/* An Image.gz-dtb appends the DTBs to the kernel as an unpadded
+		 * cat, so the tree the bootloader hands over can start at an odd
+		 * address (the stock starqltechn set has a member at 0xb5c9d).
+		 * With the MMU off
 		 * that makes an unaligned u32 load fault, and aligning absolute
 		 * addresses instead of in-tree offsets misparses the tree. */
 		build_fdt_args(bad + 1, 0x90000000UL, 0x90100000UL, BA_PX01);
@@ -561,6 +698,77 @@ int main(void)
 		      !starq_elvss_off("") && !starq_elvss_off(NULL) &&
 		      !starq_elvss_off("b5,8f"),
 		      "only \"off\" disables the override");
+	}
+
+	printf("== a real-length ABL bootargs, panel token LAST\n");
+	{
+		/* The live DTB on this phone (data/live.dtb) carries a 1793-byte
+		 * /chosen/bootargs: the stock cmdline, then ABL's own additions
+		 * (root=, androidboot.serialno=, ...), then
+		 * msm_drm.dsi_display0=<panel>: - LAST. A 512-byte buffer cut it
+		 * mid-token at "msm_drm.dsi_di" and the phone printed
+		 * panel=UNKNOWN. These cases are that exact shape. */
+		char buf[2048 + 16];
+		const char *s;
+		size_t n;
+		int guard;
+
+		s = long_bootargs(BA_PX01_TOKEN, 1700);
+		n = strlen(s);
+		check(n > 512 && n <= 2048,
+		      "PX01 line is %zu bytes (> 512, the real line is 1793)", n);
+
+		memset(buf, 0xaa, sizeof(buf));
+		check(chosen_str_fdt(s, buf, 2048) && strcmp(buf, s) == 0,
+		      "fdt_chosen_str returns the whole %zu-byte line", n);
+		check(starq_dsi_panel_from_cmdline(s, buf, sizeof(buf)) ==
+		      STARQ_PANEL_PX01 &&
+		      strcmp(buf, BA_PX01_TOKEN) == 0,
+		      "token at the END of a >512-byte line -> PX01 (\"%s\")", buf);
+
+		/* ...through the loader, which is where the 512-byte buffer was */
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		dsi_link(D_LINK_VIDEO);
+		check(boot_ok_args("starqfb=0", s) != 0, "booted with the long line");
+		check(log_has("panel=PX01 name=" BA_PX01_TOKEN),
+		      "the loader logs PX01 with the full token");
+		check(log_has("msm_drm.dsi_display0=" BA_PX01_TOKEN),
+		      "and prints the whole bootargs, not a 512-byte prefix");
+
+		s = long_bootargs("ss_dsi_panel_S6E3HA8_AMB577MQ01_WQHD:config0", 1700);
+		memset(buf, 0xaa, sizeof(buf));
+		check(starq_dsi_panel_from_cmdline(s, buf, sizeof(buf)) ==
+		      STARQ_PANEL_MQ01,
+		      "MQ01 token at the END of a >512-byte line -> MQ01");
+		dsi_link(D_LINK_VIDEO);
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		check(boot_ok_args("starqfb=0", s) != 0, "booted");
+		check(log_has("panel=MQ01 name=ss_dsi_panel_S6E3HA8_AMB577MQ01_WQHD:config0"),
+		      "the loader logs MQ01 with the full token");
+		check(log_has("dcs b5 8f dc 0a"),
+		      "and the MQ01 ELVSS byte (0x0a) follows from it");
+
+		/* A line longer than the buffer must truncate and terminate, not
+		 * overrun: the read is bootloader input. */
+		s = long_bootargs(BA_PX01_TOKEN, 3000);
+		n = strlen(s);
+		check(n > 2048, "the oversize line is %zu bytes (> 2048)", n);
+		memset(buf, 0xaa, sizeof(buf));
+		check(chosen_str_fdt(s, buf, 2048) == 1, "an oversize line is read");
+		check(strlen(buf) == 2047, "truncated to 2047 chars + NUL (%zu)",
+		      strlen(buf));
+		guard = 1;
+		for (unsigned i = 2048; i < sizeof(buf); i++)
+			if ((unsigned char)buf[i] != 0xaa)
+				guard = 0;
+		check(guard, "nothing is written past the 2048-byte buffer");
+		/* The token is past the cut, so the honest answer is UNKNOWN -
+		 * and the loader must still boot and say so. */
+		dsi_link(D_LINK_VIDEO);
+		memset((void *)T_RAMOOPS, 0, T_RAMOOPS_SIZE);
+		check(boot_ok_args("starqfb=0", s) != 0,
+		      "a >2048-byte bootargs boots (no overflow, no fault)");
+		check(log_has("panel=UNKNOWN"), "and reports UNKNOWN, not garbage");
 	}
 
 	printf("== DSI DCS over the command path\n");

@@ -57,12 +57,21 @@ args=${*:-$DEFAULT_ARGS}
 [ -f "$kernel" ] || { echo "error: kernel not found: $kernel" >&2; exit 1; }
 [ -f "$stock" ] || { echo "error: stock boot image not found: $stock" >&2; exit 1; }
 
-# The RAM window is Samsung's largest free gap in the 4 GB low bank
-# (0xa1c01000..0xba000000 per the vendor reserved-memory map); 0xa2000000 is
-# where the postmarketOS initramfs is loaded on this exact device. Passed
-# explicitly so mkadt.py does not print its PROVISIONAL warning.
-RAM_BASE=0xa2000000
-RAM_SIZE=0x18000000
+# The RAM window is the second-largest free gap in the live DTB's
+# reserved-memory map and the only big one clear of the payload:
+#
+#   0xd4000000 + 0x2b000000 (688 MiB), ends 0xff000000
+#     below  camera_mem_region 0xc0000000 + 0x14000000 -> ends 0xd4000000
+#     above  qseecom_ta_region 0xff000000 + 0x01000000 -> starts 0xff000000
+#     clear of the framebuffer (0x9d400000), ramoops (0xa1300000) and the BOOT
+#            ramdisk ABL loads at 0xa2000000 (0xfd3df0 = 15.8 MiB).
+#
+# The largest gap (0xa1c01000 + 0x1e3ff000, 483 MiB) contains that ramdisk: a
+# window starting at 0xa2000000 has the payload inside it and the loader refuses
+# to boot (seen on hardware). Kept in sync with BOARDS['starqltechn'] in
+# tools/mkadt.py and XNU_RAM_BASE/XNU_RAM_SIZE in shim/starqltechn/loader.c.
+RAM_BASE=0xd4000000
+RAM_SIZE=0x2b000000
 
 # Fail on the toolchain before doing any work: the cross compiler is the one
 # that is missing on a plain desktop, and its absence used to surface as a

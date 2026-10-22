@@ -69,19 +69,32 @@ BOARDS = {
         cpu_compatible=('qcom,kryo470', 'ARM,v8'),
         soc_compatible='qcom,sm7150',
     ),
-    # Samsung Galaxy S9 SM-G9600 / SC-02K (SDM845). Values read from mainline
-    # arch/arm64/boot/dts/qcom/sdm845-samsung-starqltechn.dts + sdm845.dtsi.
+    # Samsung Galaxy S9 SM-G9600 / SC-02K (SDM845). SoC values from mainline
+    # arch/arm64/boot/dts/qcom/sdm845-samsung-starqltechn.dts + sdm845.dtsi;
+    # dram_base/dram_size measured from this phone's own live DTB (data/live.dtb,
+    # gitignored).
     'starqltechn': Board(
-        # PROVISIONAL - the 4 GB bank starts at 0x80000000 but is full of
-        # carve-outs; we only know the ones in mainline Linux, and only up to the
-        # first one (removed-region@88f00000). The real range, including the
-        # hyp/tz/modem/pil regions that only the live tree knows, is UNKNOWN
-        # until an FDT is pulled from the phone:
-        #     adb shell cat /sys/firmware/fdt > live.dtb
-        #     dtc -I dtb -O dts -o live.dts live.dtb   # memory + reserved-memory
-        # Then set dram_base/dram_size here (or pass --ram-base/--ram-size).
-        dram_base=0x80000000,
-        dram_size=0x08f00000,               # up to removed-region@88f00000
+        # The kernel-managed RAM: the second-largest free gap in the live DTB's
+        # reserved-memory map, and the only one large enough that is also clear
+        # of everything ABL leaves behind. Measured, not guessed:
+        #
+        #   0xd4000000 + 0x2b000000 (688 MiB), ends 0xff000000
+        #     below  camera_mem_region  0xc0000000 + 0x14000000 -> ends 0xd4000000
+        #     above  qseecom_ta_region  0xff000000 + 0x01000000 -> starts 0xff000000
+        #     clear of cont_splash_region 0x9d400000 + 0x2400000 (framebuffer),
+        #              ramoops 0xa1300000 + 0x100000, and the BOOT ramdisk ABL
+        #              loads at 0xa2000000 (0xa2000000..0xa2fd3df0, 0xfd3df0 =
+        #              15.8 MiB).
+        #
+        # The largest gap (0xa1c01000 + 0x1e3ff000, 483 MiB) is NOT usable: the
+        # payload sits in the middle of it. Using it started the window exactly
+        # on the ramdisk, and the loader's overlap check correctly refused to
+        # boot on hardware.
+        #
+        # Must match XNU_RAM_BASE/XNU_RAM_SIZE in shim/starqltechn/loader.c and
+        # RAM_BASE/RAM_SIZE in tools/starq-boot.sh.
+        dram_base=0xd4000000,
+        dram_size=0x2b000000,
         # No usable bank above 4 GiB: --highmem does not apply, and the S9 has
         # only 4 GB total, so there is nothing to fall back to.
         high_dram=None,
@@ -100,7 +113,6 @@ BOARDS = {
         ncpus=8,                            # MPIDR 0x000..0x700, kryo385
         cpu_compatible=('qcom,kryo385', 'ARM,v8'),
         soc_compatible='qcom,sdm845',
-        ram_provisional=True,
     ),
 }
 

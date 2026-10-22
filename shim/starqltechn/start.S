@@ -1,23 +1,23 @@
 /* SPDX-License-Identifier: GPL-2.0-only
- * Galaxy S9 (starqltechn, Qualcomm SDM845) S-Boot XNU loader entry.
+ * Galaxy S9 (starqltechn, Qualcomm SDM845) ABL XNU loader entry.
  *
- * S-Boot boots the kernel section of a Samsung boot.img the way a Linux
- * bootloader does, not the way ABL boots its own image, but it still expects
- * the arm64 Linux Image header at the start of the kernel: it reads
- * text_offset/image_size to know what it loaded (the S8 port shipped the
- * header for the same reason). S-Boot enters at EL1 with the MMU and caches
- * off, CNTFRQ_EL0 possibly 0, and x0 = DTB.
+ * The bootloader here is Qualcomm ABL (`bota` carries `abl.elf`), not an Exynos
+ * S-Boot. It boots the kernel section of a Samsung boot.img the way a Linux
+ * bootloader does, and it still expects the arm64 Linux Image header at the
+ * start of the kernel: it reads text_offset/image_size to know what it loaded
+ * (the S8 reference port shipped the header for the same reason). ABL enters at
+ * EL1 with the MMU and caches off, CNTFRQ_EL0 possibly 0, and x0 = DTB.
  *
  * Position independent: nothing here refers to a link-time address except
  * through PC-relative arithmetic (adr), so the image may be linked at 0 and
- * run wherever S-Boot put it. shim/starqltechn/build.sh fails the build if an
+ * run wherever ABL put it. shim/starqltechn/build.sh fails the build if an
  * ABS64 relocation sneaks in.
  *
  * text_offset is 0x80000 as in the stock Samsung kernel and the S8 port; that
- * port boots with it, i.e. S-Boot enters at the start of the kernel section it
- * loaded and does not add text_offset to the entry address. (If that ever
- * turns out wrong the phone shows no text at all: the first thing to try is
- * text_offset 0.)
+ * port boots with it, i.e. the bootloader enters at the start of the kernel
+ * section it loaded and does not add text_offset to the entry address. (If
+ * that ever turns out wrong the phone shows no text at all: the first thing to
+ * try is text_offset 0.)
  */
 	.section .text.head, "ax"
 	.globl _head
@@ -56,7 +56,7 @@ _start:
 2:	mov	x0, x19
 	lsr	x1, x20, #2		/* CurrentEL -> 1 at EL1 */
 	mov	x2, x21
-	/* x3 = where S-Boot actually put us, x4 = image length: both are only
+	/* x3 = where ABL actually put us, x4 = image length: both are only
 	 * known at run time (the image is linked at 0 and is position
 	 * independent), so the loader can tell whether zeroing the RAM window
 	 * would erase itself. */

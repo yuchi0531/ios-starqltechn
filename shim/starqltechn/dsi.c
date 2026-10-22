@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * SDM845 / DSI0 command-path transmit for starqltechn (Galaxy S9).
  *
- * S-Boot hands over a live link: MDSS, DSI0, the PLL and the S6E3HA8 panel are
+ * ABL hands over a live link: MDSS, DSI0, the PLL and the S6E3HA8 panel are
  * powered and PLL-locked. This file therefore does not initialise anything. It
  * only pushes MIPI DCS packets through the DSI command DMA, which is a separate
  * engine from the video engine, and it reads (never writes) every register that
@@ -184,7 +184,7 @@
 #define DMA_MAX_BYTES		256u
 #define FIFO_MAX_BYTES		64u
 
-/* Bounded waits. There is no usable clock here (S-Boot may enter with
+/* Bounded waits. There is no usable clock here (the bootloader may enter with
  * CNTFRQ_EL0 = 0, see start.S), so these are iteration counts, not
  * milliseconds: one iteration is one Device-memory register read. A 60 Hz
  * frame is ~16 ms, far inside these bounds; a transfer that has not completed
@@ -204,7 +204,7 @@ static int dsi_link_down;	/* DSI_CTRL.ENABLE was clear: send nothing */
  * and we must not program the MDSS SMMU: the buffer has to sit in memory the
  * display pipeline already has mapped. That is the bootloader framebuffer
  * reservation ("framebuffer_mem", 0x9d400000 + 0x02400000, the only region
- * S-Boot mapped for MDSS). The visible panel is the first 1440*2960*4 =
+ * ABL mapped for MDSS). The visible panel is the first 1440*2960*4 =
  * 0x1042800 bytes, so STARQ_DSI_CMD_BUF_PA (the last page of the carve-out) is
  * outside anything the test pattern, the text console or XNU's framebuffer
  * console touches. Caches are off (start.S clears SCTLR.C before entry), so the
@@ -472,7 +472,7 @@ static int contains(const char *hay, const char *needle)
  * The bootloader names the panel in its own command line, which it puts in the
  * DTB's /chosen/bootargs; the vendor display driver parses the same string
  * (dsi_display.c:7061-7064) and matches the node name against panel->name
- * (ss_dsi_panel_common.c:4862-4876). Free of risk: it is a string S-Boot
+ * (ss_dsi_panel_common.c:4862-4876). Free of risk: it is a string ABL
  * already wrote, and reading it means no display register is touched.
  */
 int starq_dsi_panel_from_cmdline(const char *bootargs, char *out,

@@ -2,7 +2,58 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
-### >>> UPDATE 2026-10-22 (latest): the boot.img kernel slot must be GZIP — that was the boot-to-recovery bug <<<
+### >>> UPDATE 2026-10-23 (latest): loader RUNS and draws; XNU window moved off the payload; full bootargs <<<
+
+**Hardware result: the loader executes and paints the panel.** The boot.img gzip fix
+(previous section) was right. The screen shows the console and the loader's log. Two
+blockers were found there and are now fixed **on the host, not yet re-flashed**:
+
+1. **`/chosen/bootargs` was truncated at 512 bytes.** The real property on this SC-38 is
+   **1793 bytes**: the stock cmdline, then ABL's own additions (`root=`,
+   `androidboot.serialno=`, ...) and, **last**, `msm_drm.dsi_display0=<panel>:`. A
+   `char bootargs[512]` cut it mid-token at `msm_drm.dsi_di`, so the panel probe answered
+   `panel=UNKNOWN` on hardware. `STARQ_BOOTARGS_MAX` is now **2048**;
+   `fdt_chosen_str()` already returns the full length and truncates+terminates safely for
+   anything longer (proved with a 2955-byte line), and
+   `starq_dsi_panel_from_cmdline()` already scans the whole string, which the new
+   >512-byte tests now pin down: a token at the END of a >512-byte line yields `PX01` /
+   `MQ01` correctly, and a >2048-byte line yields `UNKNOWN` with no overflow.
+
+2. **The XNU window started exactly on the payload.** ABL loads the BOOT ramdisk at
+   `0xa2000000` (`initrd=0xa2000000 end=0xa2fd3df0`, `0xfd3df0` = 15.8 MiB), and the
+   ADT asked for
+   `phys=0xa2000000 mem=0x18000000` -> the loader's overlap check correctly refused
+   ("FAIL: payload sits inside the XNU RAM window"). **The check is right; the window
+   moved.** New window: **`0xd4000000 + 0x2b000000`, 688 MiB, ends `0xff000000`**, the
+   second-largest free gap in the live DTB (was 384 MiB):
+   - below: `camera_mem_region` `0xc0000000 + 0x14000000` (ends exactly `0xd4000000`)
+   - above: `qseecom_ta_region` `0xff000000 + 0x1000000`
+   - clear of the framebuffer `0x9d400000`, `ramoops` `0xa1300000` and the payload
+     `0xa2000000`.
+   The **largest** gap (`0xa1c01000 + 0x1e3ff000`, 483 MiB) is unusable: the payload sits
+   inside it. Changed in all three places that must agree: `tools/mkadt.py`
+   `BOARDS['starqltechn']` (`dram_base`/`dram_size`, and its `ram_provisional` flag is
+   gone), `shim/starqltechn/loader.c` (`XNU_RAM_BASE`/`XNU_RAM_SIZE`, with the bounding
+   regions recorded in the comment) and `tools/starq-boot.sh` (`RAM_BASE`/`RAM_SIZE`).
+
+**Also:** the loader's first line said "S-Boot"; this board is **Qualcomm ABL**. Fixed
+there and in every other user-visible claim about *this* board (`start.S`, `loader.ld`,
+`dsi.c`, `dsi.h`, `host_test.c`, `fdt.c`, `starq-flash.sh`). The S8/Exynos reference-port
+mentions stay as they are, because there "S-Boot" is the right word.
+
+**Host verification (no phone):** `bash shim/starqltechn/build.sh` -> 56,384-byte arm64
+Image; `make -C shim/starqltechn` -> all checks pass (window-vs-payload arithmetic, the
+payload-at-`0xa2000000` boot, the >512-byte and >2048-byte bootargs cases, the ABL header
+line); `python3 tools/mkadt.py --board starqltechn --ram-base 0xd4000000 --ram-size
+0x2b000000 --dump` -> `dram-base 0xd4000000`, `dram-size '|||+'` (= `0x2b000000`);
+`tools/starq-boot.sh` end to end -> 27,783,168-byte image, gzip kernel slot, 15 DTBs, id
+valid, and the ADT inside the ramdisk carries the new base/size; `tools/validate-repo.py`
+passes; `bash -n` clean on the touched scripts.
+
+**Next:** flash that image. The panel line must now read `panel=PX01 name=...` (or MQ01)
+and the boot must get past the window check.
+
+### >>> UPDATE 2026-10-22: the boot.img kernel slot must be GZIP — that was the boot-to-recovery bug <<<
 
 **Hardware result.** The 27,828,224-byte image above was flashed to
 `/dev/block/by-name/boot` (`/dev/block/sda20`, write verified byte-identical on read-back) on
@@ -72,7 +123,7 @@ a gzip stream that ends at `0xe5352e`, followed by **15 concatenated bare FDTs**
 remaining `0xaa5e86` bytes. All 15 are `"Samsung STARQLTE CHN PROJECT RevNN"`, over 13
 distinct `qcom,board-id` values `(0x8, 0x2)` … `(0x8, 0xe)` and
 `qcom,msm-id (0x141, 0x10000 | 0x20000 | 0x20001)`; the per-FDT table is in the section
-below. **S-Boot selects one FDT by board-id/msm-id and hands it to the kernel in `x0`** -
+below. **ABL selects one FDT by board-id/msm-id and hands it to the kernel in `x0`** -
 exactly the contract `shim/starqltechn/start.S` + `loader.c` already implement (they read
 `/chosen/...` out of that tree), which is why the loader needed no change for this. The
 packer now probes the template and handles both shapes; the DTBH path is unchanged for
@@ -86,14 +137,14 @@ From the live DTB's `reserved-memory`, the free gaps in the low 4 GB bank are:
 | `0x80000000 + 0x5700000` | 87 MiB | |
 | `0x85f00000 + 0x8100000` | 129 MiB | |
 | `0x96700000 + 0x6d00000` | 109 MiB | |
-| `0xa1c01000 + 0x183ff000` | 388 MiB | **largest real gap; this is ours** |
+| `0xa1c01000 + 0x183ff000` | 388 MiB | largest, but the **payload sits in it** |
 | `0xc0000000 + 0x40000000` | 1024 MiB | runs to the 4 GiB bank end |
 
-The window we already use, **`0xa2000000 + 0x18000000`**, sits inside the 388 MiB gap and
-ends **exactly at `0xba000000`** - the start of `modem_shared_mem_region`. Below it is
-`sec_debug_autocomment`, which ends at `0xa1c01000`; the `0x3ff000` (4 MiB) between that and
-our base is the entire margin. **The guess was correct, and is now confirmed against the
-device's own device tree** - the loader and `starq-boot.sh` values do not change.
+The window this section used to claim, **`0xa2000000 + 0x18000000`**, does sit inside the
+388 MiB gap and ends at `0xba000000` - but it also starts **exactly on the BOOT ramdisk
+ABL loads** (`initrd=0xa2000000`), which is why the boot refused on hardware. It is
+superseded: the window is now **`0xd4000000 + 0x2b000000`** (688 MiB) - see the 2026-10-23
+section at the top.
 
 Three other numbers stopped being assumptions in the same dump:
 
@@ -161,7 +212,7 @@ sweet's CPU-copy path applies. `cmd=1` + `video=0` -> the panel holds the frame 
 GRAM, nothing written to RAM appears, and MDSS `write_memory_start` + a real DSI bring-up
 become mandatory. `en=0` -> link down, nothing sent, XNU still starts.
 
-**Also still open: which of the 15 appended DTBs S-Boot selects.** It picks by
+**Also still open: which of the 15 appended DTBs ABL selects.** It picks by
 `qcom,board-id`/`msm-id`, and the boot image does **not** record which one was chosen. The
 phone's own board-id is readable from the live DTB (`qcom,board-id = <0x08 0x08>` appears in
 the first entry), but the *actual selection* has to be confirmed from the bootloader's own log
@@ -242,7 +293,7 @@ they work around it with a Magisk module whose entire payload is one line:
 echo -15, -14, 0, 1, 30, 40, 60, 80, 100 > /sys/class/lcd/panel/temperature
 ```
 
-Do the equivalent from our own code. We have no MDSS/DSI driver - only the link S-Boot
+Do the equivalent from our own code. We have no MDSS/DSI driver - only the link ABL
 leaves behind - so "our code" means the loader and XNU talking DCS directly.
 
 **What that line actually does (vendor `s6e3ha8` driver).**
@@ -283,7 +334,7 @@ included - untouched. Bytes 1..3 are the only ones the vendor driver ever comput
 passes plus BTA handling on an unproven link - not worth it. No DCS read was implemented;
 if it ever becomes necessary, `0xD6` after a `0xB0` page select is the vendor's mechanism.
 
-**Panel identity is free.** S-Boot's own command line carries it in the DTB's
+**Panel identity is free.** ABL's own command line carries it in the DTB's
 `/chosen/bootargs`:
 
 ```
@@ -381,7 +432,7 @@ boot-arg. The panel resets on the next power cycle, so a plain reboot reverts it
    from "command sent".
 3. If unchanged: try `starqelvss=` overrides (`starqmps=cc`, a different byte 3), and only
    then the 24-byte PX01 form with **byte 23 echoed from a real read**, never synthesised.
-4. Check whether the fix survives suspend/resume, or whether S-Boot re-sends the panel
+4. Check whether the fix survives suspend/resume, or whether ABL re-sends the panel
    init on every resume (it re-inits the panel on boot; a resume may be a different path).
 5. `starqelvss=off` is the revert if any DSI access hangs the boot - and it now guarantees
    zero register reads, so it is also the safe diagnostic boot.
@@ -411,7 +462,7 @@ port is unaffected.
 - `5c3a3ef` `xnu/patches/0082-starqltechn-board.patch`: STARQLTECHN machine config,
   early framebuffer, RPMh addresses, S6SY761 touch with S2DOS05 bit-banged rails,
   MAX77705 battery, PM8998 PON/GPIO keys.
-- `d191a0b` `shim/starqltechn/`: the S-Boot loader (`start.S`, `loader.ld`,
+- `d191a0b` `shim/starqltechn/`: the ABL loader (`start.S`, `loader.ld`,
   `loader.c`, `build.sh`, `host_test.c`, `Makefile`) - the S8-proven validation
   chain, XNU-RAM zeroing, dual-zone ramoops logging, and the framebuffer test
   pattern that decides the display work.
@@ -533,14 +584,14 @@ time**. Run 39585689828 died on a GitHub infrastructure network error and then s
 
 **Open, needs the phone (in order):**
 1. Live FDT for the RAM window: TWRP, `adb shell cat /sys/firmware/fdt > live.dtb`.
-   `0xa2000000 + 0x18000000` is Samsung's largest free gap in the vendor
+   `0xa2000000 + 0x18000000` was the largest free gap in the vendor
    `reserved-memory` map plus the postmarketOS initramfs load address - not measured
    on this handset.
 2. Real `by-name` node names: `tools/starq-flash.sh boot-name`.
 3. The real stock `boot.img` as the packer's header/DTB donor instead of the
    synthetic stub (`tools/starq-flash.sh backup`).
 4. **The framebuffer question, which decides the display work:** run the loader's
-   test pattern. Bands + magenta block visible -> S-Boot leaves the panel scanning
+   test pattern. Bands + magenta block visible -> ABL leaves the panel scanning
    out of `0x9d400000` and sweet's CPU-copy display path transfers unchanged.
    Samsung logo, black or garbage instead -> command-mode panel with its own GRAM;
    MDSS/DSI has to be programmed, a much bigger job.
