@@ -711,18 +711,21 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr,
 	out("\n");
 
 	uintptr_t adt_pa = kernel_end;
-	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-	if (ba_pa + PAGE_SIZE > mem_end)
+	/* boot_args goes on the first 16 KiB boundary at or after the ADT, via
+	 * starq_boot_args_pa() in loader.h - see there for why 16 KiB and not 4.
+	 * This placement is what used to panic the kernel (arm_vm_init.c:1491). */
+	uintptr_t ba_pa = starq_boot_args_pa(adt_pa, p->adt_size);
+	if (ba_pa + PAGE_16K > mem_end)
 		return fail("no room for ADT/boot_args");
 	copy(adt_pa, rd_start + p->adt_off, p->adt_size);
-	zero(ba_pa, PAGE_SIZE);
+	zero(ba_pa, PAGE_16K);
 	volatile struct boot_args *ba = (volatile struct boot_args *)ba_pa;
 	ba->Revision = 2;
 	ba->Version = 2;
 	ba->virtBase = p->virt_base;
 	ba->physBase = p->phys_base;
 	ba->memSize = p->mem_size;
-	ba->topOfKernelData = ba_pa + PAGE_SIZE;
+	ba->topOfKernelData = ba_pa + PAGE_16K;
 	/* xnu reads the ADT through its own mapping: a virtual address. */
 	ba->deviceTreeP = p->virt_base + (adt_pa - p->phys_base);
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
@@ -735,8 +738,17 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr,
 	ba->Video.v_height = FB_H;
 	ba->Video.v_depth = 32;
 	ba->memSizeActual = p->mem_size;
-	clean(adt_pa, ba_pa + PAGE_SIZE);
+	clean(adt_pa, ba_pa + PAGE_16K);
+	/* Print the whole provenance of topOfKernelData, and the invariant the
+	 * kernel will assert on (arm_vm_init.c:1491). adt is 16K clean and
+	 * ba_pa is rounded up from it, so the alignment below is the proof the
+	 * next hardware boot needs to see *before* the panic if it recurs. */
 	kp("adt", adt_pa, "boot_args", ba_pa);
+	kv("top", ba->topOfKernelData);
+	kv("orig_va", p->virt_base + (ba->topOfKernelData - p->phys_base));
+	out("\n");
+	out("top 16K-aligned: ");
+	out((ba->topOfKernelData & (PAGE_16K - 1)) ? "no\n" : "yes\n");
 	out("\n");
 
 	uintptr_t entry_pa = p->phys_base + (p->entry_va - p->virt_base);

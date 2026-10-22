@@ -2,7 +2,72 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
-### >>> UPDATE 2026-10-23 (latest): loader RUNS and draws; XNU window moved off the payload; full bootargs <<<
+### >>> UPDATE 2026-10-23b (latest): `topOfKernelData` must be 16 KiB aligned — the MEET EARLY 7 panic <<<
+
+**Hardware result (real panic, S9 `starqltechn`, 16 KiB pages):**
+```
+MEET EARLY 7: entering arm_vm_init
+MEET EARLY PANIC: arm_vm_init.c:1491 Assertion failed: (org_va & ARM_POMASK) == 0
+```
+(the kernel's string is `(orig_va & ARM_PGMASK) == 0`, `ARM_PGMASK == 0x3fff` because
+`__ARM_16K_PG__` is set.)
+
+**Root cause (one cause, confirmed):** `arm_vm_physmap_init()` calls
+`arm_vm_physmap_slide(temp_ptov_table, args->topOfKernelData - gPhysBase + gVirtBase, ...)`,
+and that function asserts `(orig_va & ARM_PGMASK) == 0`. `virtBase` and `physBase` are both
+already 16 KiB clean (mkpayload.py), so the constraint reduces to **`topOfKernelData` must be
+16 KiB aligned**, i.e. **`boot_args` must be placed on a 16 KiB boundary**. Our starqltechn
+loader placed it with a 4 KiB `PAGE_SIZE`. The payload/ADT were already 16 KiB clean
+(`kernel_end` = `0xd64c4000`), but the ADT is **0x312c** bytes, so a 4 KiB round-up put
+`boot_args` at `0xd64c8000` and `topOfKernelData` at **`0xd64c9000`** — remainder `0x1000` →
+panic. The sweet loader (`shim/loader.c`, `PAGE_16K`) always did it right; this port did not.
+
+**Fix:** `shim/starqltechn/loader.h` now defines `PAGE_16K` and one shared inline
+(`starq_boot_args_pa()`), used by `loader.c` for the round-up, the `mem_end` bound, the
+`zero()`, `topOfKernelData` and the final `clean()`. `PAGE_SIZE` was **removed**: an audit
+found it used only in exactly those five boot_args lines, nothing else in
+`shim/starqltechn/` (`dsi.h`'s `0x9f7ff000` and `start.S`'s `#0x1000` are literal and
+unrelated). Numbers for the real payload:
+
+| | before (4 KiB) | after (16 KiB) |
+| --- | --- | --- |
+| `adt_pa` | `0xd64c4000` | `0xd64c4000` |
+| `boot_args` | `0xd64c8000` | `0xd64c8000` |
+| `topOfKernelData` | `0xd64c9000` ✗ | **`0xd64cc000`** ✓ |
+| `orig_va` | `0xfffffe00084c9000` (rem `0x1000`) ✗ | **`0xfffffe00084cc000`** (rem 0) ✓ |
+
+The loader's log now prints `adt`, `boot_args`, `top=0x...`, `orig_va=0x...` and an explicit
+`top 16K-aligned: yes/no` line, so the next hardware boot proves it before the kernel runs.
+`make -C shim/starqltechn` additionally sweeps **every ADT size 0..0x8000** through the
+loader's own expression and asserts `% 0x4000 == 0` in all 32769 cases (the old 4 KiB rule
+only aligned by luck for some ADT sizes), and boots payloads with odd ADT sizes end to end.
+
+**Interpreting the NEXT boot, in this order:**
+1. **Success signal: `MEET EARLY 8: leaving bootstrap TTBR0`.** That is past
+   `arm_vm_physmap_slide()` and past the panic above.
+2. If instead you see the **bound** assertion
+   `(temp_ptov_table[ptov_index - 1].va + len) <= physmap_end` in `arm_vm_init.c`, that is the
+   *different* known issue patch `0011-sweet-physmap-alignment-padding.patch` exists to
+   prevent (each PTOV entry can consume up to one extra twig of VA because the slide
+   preserves the PA's block offset; the patch reserves that padding in both the aperture bound
+   and its L1 allocation). It would mean the kernel was built **without** 0011 or that its
+   padding is still too small — not that this alignment fix regressed. Check the CI build
+   applied 0011 before touching anything here.
+3. A `yes` on the `top 16K-aligned:` line plus an `MEET EARLY 7` panic would contradict this
+   analysis; a `no` there means the flashed image predates this commit.
+
+**Host verification (no phone):** `bash shim/starqltechn/build.sh` → **56,560-byte** arm64
+`Image`; `make -C shim/starqltechn` → **213 checks, all pass** (incl. the 32769-case ADT
+sweep, the real-payload address triple above and the log lines);
+`tools/starq-boot.sh xnu/out-starqltechn/kernel.development.starqltechn data/boot-backup.img
+shim/out/starq-ios-boot.img` → **27,783,168-byte** image, kernel slot still gzip (member
+`0x28bd` bytes at `kernel+0x0` decompressing to `0xdcf0` = 56,560 bytes, which is `Image`
+byte-for-byte), 15 appended DTBs, id valid, `python3 tools/validate-repo.py` passes.
+
+**Not done:** not flashed. Flash `shim/out/starq-ios-boot.img` and look for
+`MEET EARLY 8`.
+
+### >>> UPDATE 2026-10-23: loader RUNS and draws; XNU window moved off the payload; full bootargs <<<
 
 **Hardware result: the loader executes and paints the panel.** The boot.img gzip fix
 (previous section) was right. The screen shows the console and the loader's log. Two

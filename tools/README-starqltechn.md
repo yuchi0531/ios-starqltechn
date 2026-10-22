@@ -10,13 +10,56 @@ there took two hardware findings: a *raw* kernel slot does not boot at all (see
 showed up in the loader's own log - a 512-byte `/chosen/bootargs` buffer that
 truncated the panel token (`panel=UNKNOWN`), and an XNU RAM window that began
 exactly on the payload ABL loads at `0xa2000000` (see "What is still open"). Both
-are fixed. The kernel builds in CI (`xnu-kernel` artifact, 17,172,688-byte
-`kernel.development.starqltechn`) and the whole chain from Mach-O to a Samsung
-`boot.img` runs on a Linux host against the phone's **own** pulled boot partition
-(`data/boot.emmc.win.img`, gitignored; see step 2): 56,384-byte loader `Image`,
-27,783,168-byte `starq-ios-boot.img` with the stock header and cmdline, our
-`Image.gz` + the stock `Image.gz-dtb` DTB set and a recomputed kernel SHA-1.
-Everything that still needs the phone is in "What is still open".
+are fixed. A third one then showed up in the *kernel*: with the loader finally
+handing over control, XNU panicked at `arm_vm_init.c:1491`
+(`(orig_va & ARM_PGMASK) == 0`) right after `MEET EARLY 7`, because **the loader
+placed `boot_args` on a 4 KiB boundary** and `topOfKernelData` must be **16 KiB
+aligned** on this board - see "`boot_args` and `topOfKernelData` must be 16 KiB
+aligned" below. Also fixed. The kernel builds in CI (`xnu-kernel` artifact,
+17,172,688-byte `kernel.development.starqltechn`) and the whole chain from Mach-O
+to a Samsung `boot.img` runs on a Linux host against the phone's **own** pulled
+boot partition (`data/boot.emmc.win.img`, gitignored; see step 2): 56,560-byte
+loader `Image`, 27,783,168-byte `starq-ios-boot.img` with the stock header and
+cmdline, our `Image.gz` + the stock `Image.gz-dtb` DTB set and a recomputed kernel
+SHA-1. Everything that still needs the phone is in "What is still open".
+
+## `boot_args` and `topOfKernelData` must be 16 KiB aligned
+
+The kernel for this board is built with **`__ARM_16K_PG__`** (16 KiB pages), so
+`ARM_PGMASK` is `0x3fff`. `arm_vm_physmap_init()` slides the physmap with
+`arm_vm_physmap_slide(temp_ptov_table, topOfKernelData - gPhysBase + gVirtBase, ...)`
+and that function asserts `(orig_va & ARM_PGMASK) == 0`. `virtBase` and
+`physBase` come out of `tools/mkpayload.py` already 16 KiB clean, so the whole
+constraint reduces to **`topOfKernelData` - i.e. the `boot_args` placement -
+being 16 KiB aligned**.
+
+The loader therefore rounds `boot_args` up to `PAGE_16K` (`0x4000`), not `0x1000`:
+the ADT on this board is **`0x312c`** bytes, so a 4 KiB round-up left
+`topOfKernelData` at remainder `0x1000` and panicked the kernel at
+`arm_vm_init.c:1491` (`MEET EARLY 7`). With the real payload
+(`phys_base 0xd4000000`, `kernel_end 0xd64c4000`, ADT `0x312c`):
+
+| | 4 KiB placement (the bug) | `PAGE_16K` (now) |
+| --- | --- | --- |
+| `adt_pa` | `0xd64c4000` | `0xd64c4000` |
+| `boot_args` | `0xd64c8000` | `0xd64c8000` |
+| `topOfKernelData` | `0xd64c9000` | **`0xd64cc000`** |
+| `orig_va` | `0xfffffe00084c9000` (rem `0x1000`) | **`0xfffffe00084cc000`** (rem 0) |
+
+`starq_boot_args_pa()` in `shim/starqltechn/loader.h` is the single definition of
+that placement - `loader.c` uses it and `make -C shim/starqltechn` sweeps every
+ADT size `0..0x8000` through the same expression, asserting `% 0x4000 == 0` in all
+32769 cases. **Do not give this board a 4 KiB `boot_args` alignment again**: with
+16 KiB pages it only ever aligned by luck for ADT sizes that are themselves
+multiples of 16 KiB.
+
+The loader logs `adt=`, `boot_args=`, `top=`, `orig_va=` and an explicit
+**`top 16K-aligned: yes/no`** line, so the panel/ramoops log says whether the
+kernel's assertion can hold *before* control is handed over. The signal that this
+is behind us is **`MEET EARLY 8: leaving bootstrap TTBR0`**. The *next* assertion
+in that area, `(temp_ptov_table[ptov_index - 1].va + len) <= physmap_end`, is a
+different issue that `xnu/patches/0011-sweet-physmap-alignment-padding.patch`
+exists to prevent (per-PTOV-entry twig padding) - not a return of this one.
 
 ## Reference ports
 
@@ -291,11 +334,11 @@ Measured artifacts on a Linux host (real kernel from CI, real stock image
 | --- | --- |
 | `kernel.development.starqltechn` (CI run 39611433630) | 17,172,688 bytes |
 | payload (`mkpayload.py`) | 16,596,320 bytes |
-| `shim/out/Image` (loader, arm64 Linux header, magic `ARMd` at `0x38`) | 56,384 bytes |
-| `starq-ios-boot.img` (`Image.gz` 10,347 B + 15 stock DTBs, 64 MiB partition) | 27,783,168 bytes |
+| `shim/out/Image` (loader, arm64 Linux header, magic `ARMd` at `0x38`) | 56,560 bytes |
+| `starq-ios-boot.img` (`Image.gz` 10,429 B + 15 stock DTBs, 64 MiB partition) | 27,783,168 bytes |
 
-The kernel slot is **11,175,665 bytes** = gzip 10,347 B (from the 56,384-byte
-`Image`) + the 11,165,318-byte DTB set, with `d00dfeed` at slot `0x286b`, i.e.
+The kernel slot is **11,175,747 bytes** = gzip 10,429 B (from the 56,560-byte
+`Image`) + the 11,165,318-byte DTB set, with `d00dfeed` at slot `0x28bd`, i.e.
 exactly at the end of the gzip member. The boot image leaves 39,325,696 bytes of
 the partition unused; its header differs from the template only in `kernel_size`,
 `ramdisk_size` and the `id` (`dt_size` stays 0, and `os_version`/addresses/cmdline
@@ -474,7 +517,7 @@ Odin. If `userdata` was overwritten with the iOS root, format it in TWRP.
   `make -C shim/starqltechn` (step 2 above): the same loader.c compiled as host
   C with the board addresses `mmap`ed, driving its validation, copy and logging
   paths. The cross build does now succeed on the dev host (`gcc-aarch64-linux-gnu`
-  from apt, 56,384-byte Image), but a successful link only proves the code
+  from apt, 56,560-byte Image), but a successful link only proves the code
   compiles and fits; every MMIO address in it is still unproven.
 - **Which of the 15 appended DTBs does ABL pick?** The stock `Image.gz-dtb`
   carries one FDT per `qcom,board-id` (`(0x8, 0x2)` … `(0x8, 0xe)`) and ABL

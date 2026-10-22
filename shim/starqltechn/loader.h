@@ -5,7 +5,31 @@
  * loader parses (both files assert the offsets). */
 
 #define BOOT_LINE_LENGTH	608
-#define PAGE_SIZE		4096UL
+
+/* The kernel this loader starts is built with __ARM_16K_PG__ (16 KiB pages), and
+ * arm_vm_physmap_slide() (osfmk/arm64/arm_vm_init.c) asserts that
+ * virtBase + (topOfKernelData - physBase) is a multiple of ARM_PGMASK (0x3fff).
+ * virtBase and physBase both come from tools/mkpayload.py already 16K-clean, so
+ * that reduces to topOfKernelData - i.e. boot_args must be placed on a 16 KiB
+ * boundary, not a 4 KiB one. Same constant as shim/loader.c (sweet). */
+#define PAGE_16K		0x4000UL
+
+/* First 16 KiB boundary at or after the ADT ends: where boot_args goes.
+ * Inline and shared with host_test.c so the loader and the test cannot drift:
+ * the test sweeps every ADT size through this exact expression. */
+static inline uintptr_t starq_boot_args_pa(uintptr_t adt_pa, uint64_t adt_size)
+{
+	return (adt_pa + (uintptr_t)adt_size + PAGE_16K - 1) &
+	       ~(uintptr_t)(PAGE_16K - 1);
+}
+
+/* What XNU ends up seeing as args->topOfKernelData: the end of the boot_args
+ * block, one 16 KiB page past its start. This is the value that must satisfy
+ * (virtBase + (topOfKernelData - physBase)) & ARM_PGMASK == 0. */
+static inline uintptr_t starq_top_of_kernel_data(uintptr_t adt_pa, uint64_t adt_size)
+{
+	return starq_boot_args_pa(adt_pa, adt_size) + PAGE_16K;
+}
 
 /* tools/mkpayload.py v1 container. */
 struct payload_seg {

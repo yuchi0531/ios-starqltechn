@@ -249,6 +249,25 @@ static uint64_t boot_ok_args(const char *cmdline, const char *bootargs)
 			 T_RD + PAYLOAD_LEN);
 }
 
+/* One boot whose payload carries an arbitrary ADT size, so the sweep below can
+ * ask what the boot_args placement does for *every* ADT the ADT builder might
+ * emit rather than only for the one synthetic size used elsewhere. The ramdisk
+ * length handed to the loader is stretched so that an ADT of up to 0xf000 bytes
+ * passes the loader's "adt_size fits in the initrd" check (it sits right after
+ * the two segments, at 0x181000). */
+#define ADT_RD_LEN	0x190000ULL
+
+static uint64_t boot_ok_adt(uint64_t adt_size)
+{
+	build_payload(T_XNU_BASE, T_XNU_WIN, "starqfb=0");
+	((struct payload *)T_RD)->adt_size = adt_size;
+	memset((void *)(T_RD + 0x181000ULL), 0xa7, adt_size);
+	build_fdt(fdt, T_RD, T_RD + ADT_RD_LEN);
+	memset((void *)T_FB_BASE, 0x11, 0x10000);
+	memset((void *)T_RAMOOPS, 0x00, 0x10000);
+	return dl_main((uintptr_t)fdt, 1, 0x30d00800UL, (uintptr_t)T_RD, 0x40000UL);
+}
+
 /* One boot with the payload where ABL really puts it (0xa2000000) and the
  * loader image at T_RD, i.e. the arrangement that failed on hardware. */
 static uint64_t boot_ok_abl_rd(const char *cmdline, const char *bootargs)
@@ -405,6 +424,76 @@ int main(void)
 	      (unsigned long)T_FB_BASE, (unsigned long)T_RAMOOPS,
 	      (unsigned long)T_XNU_BASE, (unsigned long)T_XNU_SIZE);
 
+	printf("== boot_args / topOfKernelData are 16 KiB aligned for every ADT size\n");
+	{
+		/* XNU is built with __ARM_16K_PG__ here, and arm_vm_physmap_slide()
+		 * asserts (virtBase + (topOfKernelData - physBase)) & 0x3fff == 0.
+		 * The old loader rounded boot_args up by only 4 KiB, which held
+		 * only when the ADT size happened to be a multiple of 16 KiB - the
+		 * real ADT is 0x312c bytes, so on hardware topOfKernelData came out
+		 * at remainder 0x1000 and the kernel panicked at
+		 * arm_vm_init.c:1491. Sweep every ADT size through the loader's own
+		 * expression: the property must hold unconditionally, not by luck. */
+		unsigned bad = 0;
+		uint64_t worst = 0;
+
+		for (uint64_t adt = 0; adt <= 0x8000; adt++) {
+			uintptr_t adt_pa = T_XNU_BASE;	/* kernel_end: 16K clean */
+			uintptr_t top = starq_top_of_kernel_data(adt_pa, adt);
+
+			if (top & 0x3fff) {
+				if (!bad)
+					worst = adt;
+				bad++;
+			}
+		}
+		check(bad == 0,
+		      "ADT sizes 0..0x8000: topOfKernelData is 16K aligned in all %u cases (%u bad, first %#llx)",
+		      0x8001, bad, (unsigned long long)worst);
+		/* The specific shape that failed: the real board's payload. Measured
+		 * from xnu/out-starqltechn/kernel.development.starqltechn via
+		 * tools/mkpayload.py: virt_base 0xfffffe0006000000, kernel_end
+		 * 0xfffffe00084c4000 (= 0xd64c4000 PA), ADT 12588 bytes (0x312c).
+		 * Before this fix: top 0xd64c9000, orig_va
+		 * 0xfffffe00084c9000, remainder 0x1000 -> the hardware panic. */
+		check(starq_boot_args_pa(0xd64c4000UL, 0x312c) == 0xd64c8000UL &&
+		      starq_top_of_kernel_data(0xd64c4000UL, 0x312c) == 0xd64cc000UL &&
+		      (0xfffffe0006000000ULL +
+		       (starq_top_of_kernel_data(0xd64c4000UL, 0x312c) - 0xd4000000UL)) ==
+		      0xfffffe00084cc000ULL,
+		      "the real payload: adt 0xd64c4000, boot_args 0xd64c8000, top 0xd64cc000, "
+		      "orig_va 0xfffffe00084cc000 (16K clean)");
+		/* And the old 4 KiB rule, stated as the counter-example. */
+		check(((0xd64c4000UL + 0x312c + 0x1000 - 1) & ~0xfffUL) + 0x1000 ==
+		      0xd64c9000UL &&
+		      (0xfffffe00084c9000ULL & 0x3fff) == 0x1000,
+		      "the old 4 KiB placement gave top 0xd64c9000 / orig_va 0xfffffe00084c9000, "
+		      "remainder 0x1000 -> the arm_vm_physmap_slide() panic");
+	}
+
+	/* End to end: the same invariant, read back out of a live boot_args that
+	 * the loader actually wrote, with several ADT sizes inside the payload's
+	 * slack. */
+	{
+		unsigned bad = 0;
+		static const uint64_t sizes[] = { 0x1000, 0x1004, 0x1810, 0x1fff, 0x2000 };
+
+		for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+			struct boot_args *b;
+
+			if (boot_ok_adt(sizes[i]) == 0) {
+				bad++;
+				continue;
+			}
+			b = (struct boot_args *)(uintptr_t)starq_boot_args;
+			if ((b->topOfKernelData % 0x4000) ||
+			    ((b->virtBase + (b->topOfKernelData - b->physBase)) & 0x3fff))
+				bad++;
+		}
+		check(bad == 0, "booted %u payloads with odd ADT sizes, all with a 16K-clean top",
+		      (unsigned)(sizeof(sizes) / sizeof(sizes[0])));
+	}
+
 	printf("== a good payload boots\n");
 	uint64_t entry = boot_ok("debug=0xc starqfb=1");
 	check(entry == T_XNU_BASE + ENTRY_OFF, "entry %#lx == window + entry offset",
@@ -425,7 +514,31 @@ int main(void)
 	      (unsigned long long)ba->physBase, (unsigned long long)ba->memSize);
 	check(ba->deviceTreeP == VIRT_BASE + kernel_end_va() - VIRT_BASE,
 	      "deviceTreeP is the VA, not the PA (%#llx)", (unsigned long long)ba->deviceTreeP);
-	check(ba->topOfKernelData == starq_boot_args + 0x1000, "topOfKernelData");
+	check(ba->topOfKernelData == starq_boot_args + 0x4000, "topOfKernelData");
+	/* XNU on this board is built with __ARM_16K_PG__ and
+	 * arm_vm_physmap_slide() asserts (orig_va & ARM_PGMASK) == 0 with
+	 * orig_va = virtBase + (topOfKernelData - physBase). This is the
+	 * invariant a 4 KiB boot_args placement broke on hardware
+	 * (arm_vm_init.c:1491 panic on "MEET EARLY 7"). */
+	{
+		uint64_t orig_va = ba->virtBase +
+			(ba->topOfKernelData - ba->physBase);
+
+		check(ba->topOfKernelData % 0x4000 == 0,
+		      "topOfKernelData %#llx is 16K aligned (%#llx)",
+		      (unsigned long long)ba->topOfKernelData,
+		      (unsigned long long)(ba->topOfKernelData & 0x3fff));
+		check((orig_va & 0x3fff) == 0,
+		      "orig_va %#llx passes arm_vm_physmap_slide()'s assert (rem %#llx)",
+		      (unsigned long long)orig_va,
+		      (unsigned long long)(orig_va & 0x3fff));
+		check(ba->physBase == T_XNU_BASE &&
+		      ba->topOfKernelData > ba->physBase &&
+		      ba->topOfKernelData <= ba->physBase + ba->memSize,
+		      "topOfKernelData inside the window (adt %#llx, boot_args %#llx)",
+		      (unsigned long long)(T_XNU_BASE + kernel_end_va() - VIRT_BASE),
+		      (unsigned long long)starq_boot_args);
+	}
 	check(ba->Video.v_baseAddr == T_FB_BASE && ba->Video.v_width == 1440 &&
 	      ba->Video.v_height == 2960 && ba->Video.v_rowBytes == 5760,
 	      "boot_args framebuffer geometry");
@@ -610,6 +723,16 @@ int main(void)
 		check(memmem(text, len, "S9LOADER BEGIN", 14) != NULL, "header line logged");
 		check(memmem(text, len, "JUMP TO XNU", 11) != NULL, "jump line logged");
 		check(memmem(text, len, "phys=0xd4000000", 15) != NULL, "payload RAM logged");
+		/* The boot_args placement is the thing the kernel asserts on, so the
+		 * evidence must be in the log *before* the jump, not only in the
+		 * host test: adt/boot_args/top/orig_va and the alignment verdict. */
+		check(memmem(text, len, "adt=0x", 6) != NULL &&
+		      memmem(text, len, "boot_args=0x", 12) != NULL &&
+		      memmem(text, len, "top=0x", 6) != NULL &&
+		      memmem(text, len, "orig_va=0x", 10) != NULL,
+		      "adt / boot_args / top / orig_va logged");
+		check(memmem(text, len, "top 16K-aligned: yes", 20) != NULL,
+		      "and the 16K alignment verdict is explicitly logged as yes");
 		check(text[0] == 'S' && !memcmp(text, "S9LOADER BEGIN", 14),
 		      "text starts at zone+12 with the header line");
 		/* This board's bootloader is Qualcomm ABL, not an Exynos S-Boot:
