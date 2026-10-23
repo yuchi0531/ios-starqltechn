@@ -922,7 +922,7 @@
 +#endif /* SWEET */
 --- /dev/null
 +++ b/bsd/dev/starqltechn_hw.c
-@@ -0,0 +1,1093 @@
+@@ -0,0 +1,1259 @@
 +/*
 + * Samsung Galaxy S9 (SM-G9600 / SC-02K, "starqltechn", Qualcomm SDM845)
 + * board hardware that the SM7150 SWEET drivers do not cover:
@@ -933,7 +933,11 @@
 + *   - Samsung S6SY761 touch controller at 7-bit address 0x48 on GENI I2C
 + *     i2c@a8c000 (QUP wrapper 1, SE index 3), interrupt on TLMM gpio 120.
 + *   - MAX77705 fuel gauge at 0x36 and charger at 0x69 on GENI I2C
-+ *     i2c@a88000 (QUP wrapper 1, SE index 2).
++ *     i2c@a98000 (QUP wrapper 1, SE index 6, qup14 on TLMM gpio 33/34).
++ *     mainline sdm845-samsung-starqltechn.dts puts max77705 on &i2c14, and
++ *     Android's own dmesg shows "i2c_geni a98000.i2c: i2c error :-107",
++ *     so 0xa88000 (i2c10) is not this chip's bus.  The touch at 0xa8c000
++ *     (i2c11, SE 3, qup11 on gpio 31/32) is correct.
 + *
 + * The GENI programming below is the same sequence the SWEET driver uses for
 + * its SE7 touch port (bsd/dev/sweet_touch.c, patch 0060 plus the FIFO
@@ -977,7 +981,7 @@
 +
 +/* GENI I2C serial engines (sdm845.dtsi: qupv3_id_1 at 0xac0000). */
 +#define STARQ_I2C_TOUCH_SE    0x00a8c000u  /* i2c11, wrapper 1 SE 3 */
-+#define STARQ_I2C_FG_SE       0x00a88000u  /* i2c10, wrapper 1 SE 2 */
++#define STARQ_I2C_FG_SE       0x00a98000u  /* i2c14, wrapper 1 SE 6 */
 +#define STARQ_SE_SIZE         0x4000u
 +
 +/*
@@ -989,16 +993,19 @@
 +#define STARQ_GCC_QUP1_S_AHB  0x00018010u  /* gcc_qupv3_wrap_1_s_ahb_clk */
 +#define STARQ_VOTE_M_AHB      (1u << 20)
 +#define STARQ_VOTE_S_AHB      (1u << 21)
-+#define STARQ_VOTE_SE2        (1u << 24)   /* gcc_qupv3_wrap1_s2_clk */
 +#define STARQ_VOTE_SE3        (1u << 25)   /* gcc_qupv3_wrap1_s3_clk */
-+#define STARQ_GCC_SE2_HALT    0x00018274u
-+#define STARQ_GCC_SE2_RCG     0x00018278u
++#define STARQ_VOTE_SE6        (1u << 28)   /* gcc_qupv3_wrap1_s6_clk */
 +#define STARQ_GCC_SE3_HALT    0x000183a4u
 +#define STARQ_GCC_SE3_RCG     0x000183a8u
++#define STARQ_GCC_SE6_HALT    0x00018734u
++#define STARQ_GCC_SE6_RCG     0x00018738u
 +#define STARQ_CBCR_CLK_OFF    (1u << 31)
 +
 +/* GENI SE registers (include/linux/soc/qcom/geni-se.h). */
 +#define SE_STATUS       0x040u
++#define SE_SER_M_CLK    0x048u  /* GENI_SER_M_CLK_CFG */
++#define SE_CLK_CTRL_RO  0x060u  /* GENI_CLK_CTRL_RO */
++#define SE_IF_DISABLE   0x064u  /* GENI_IF_DISABLE_RO, bit 0 = FIFO_IF_DISABLE */
 +#define SE_FW           0x068u
 +#define SE_CLK_SEL      0x07cu
 +#define SE_DMA          0x258u
@@ -1015,8 +1022,13 @@
 +#define SE_TX_COUNT     0x800u
 +#define SE_RX_COUNT     0x804u
 +#define SE_TX_WM        0x80cu
-+#define SE_HW_TX        0xe24u
-+#define SE_HW_RX        0xe28u
++#define SE_HW_TX        0xe24u  /* HW_PARAM_0: TX FIFO width/depth */
++#define SE_HW_RX        0xe28u  /* HW_PARAM_1: RX FIFO width/depth */
++#define SE_HW_PROG_RAM  0xe2cu  /* HW_PARAM_2: PROG_RAM_DEPTH[10:0] */
++#define SE_FIFO_WIDTH_SHFT  24  /* FIFO_WIDTH  = GENMASK(29,24) */
++#define SE_FIFO_DEPTH_SHFT  16  /* FIFO_DEPTH  = GENMASK(21,16) */
++#define SE_FIFO_FIELD       0x3fu
++#define SE_PROG_RAM_DEPTH   0x7ffu
 +#define SE_RX_WM_IRQ    (1u << 26)
 +#define SE_RX_LAST      (1u << 27)
 +#define SE_TX_WM_IRQ    (1u << 30)
@@ -1035,6 +1047,21 @@
 +#define SE_PACK1        0x000ffefeu
 +/* 19.2 MHz source, 100 kHz: clk_div 7, t_high 10, t_low 12, t_cycle 26. */
 +#define SE_SCL_100K     ((10u << 20) | (12u << 10) | 26u)
++
++/* GENI_SER_M_CLK_CFG (geni-se.h): SER_CLK_EN = BIT(0), CLK_DIV = GENMASK(15,4). */
++#define SER_CLK_EN      (1u << 0)
++#define CLK_DIV_MSK     0xfff0u
++#define CLK_DIV_SHFT    4
++/*
++ * The 100 kHz divider is explicit: mainline geni_i2c_clk_map_19p2mhz[] has
++ * {100000, clk_div 7, t_high 10, t_low 12, t_cycle 26}, and
++ * qcom_geni_i2c_conf() writes (clk_div << CLK_DIV_SHFT) | SER_CLK_EN.  For
++ * the 19.2 MHz SE clock that is (7 << 4) | 1 = 0x71 - the same value the
++ * older, working SM7150 SE7 driver writes (sweet_touch.c, patch 0060).
++ * CLK_DIV is GENMASK(15,4), so 7 fits in it and the field is written, not
++ * ORed into whatever a previous owner left there.
++ */
++#define SE_SER_M_CLK_100K   ((7u << CLK_DIV_SHFT) | SER_CLK_EN)   /* 0x71 */
 +
 +/* TLMM pin registers (drivers/pinctrl/qcom/pinctrl-sdm845.c). */
 +#define TLMM_CTL(pin)   (0x1000u * (uint32_t)(pin))
@@ -1063,10 +1090,19 @@
 +#define STARQ_I2C21_SDA 127u
 +#define STARQ_I2C21_SCL 128u
 +#define STARQ_TOUCH_IRQ 120u
++/*
++ * TLMM function index in pinctrl-sdm845.c: index 0 is always gpio (the
++ * PINGROUP macro puts msm_mux_gpio first) and index 1 is the f1 column.
++ * gpio31/32 are PINGROUP(31, NORTH, qup11, qup14, ...) and gpio33/34 the
++ * same, so qup11 is index 1 and qup14 is index 2 on all four.
++ */
++#define STARQ_TLMM_MUX_GPIO   0u
++#define STARQ_TLMM_MUX_QUP11  1u    /* i2c11 touch: gpio 31/32 */
++#define STARQ_TLMM_MUX_QUP14  2u    /* i2c14 fuel gauge: gpio 33/34 */
 +#define STARQ_TOUCH_SDA 31u         /* qup11_i2c SDA/SCL (mainline DT) */
 +#define STARQ_TOUCH_SCL 32u
-+#define STARQ_FG_SDA    55u         /* qup10_i2c SDA/SCL (mainline DT) */
-+#define STARQ_FG_SCL    56u
++#define STARQ_FG_SDA    33u         /* qup14_i2c SDA/SCL (mainline &i2c14) */
++#define STARQ_FG_SCL    34u
 +
 +/* Samsung S6SY761 (drivers/input/touchscreen/s6sy761.c). */
 +#define TS_ADDR         0x48u
@@ -1128,10 +1164,10 @@
 +	.name = "touch i2c11",
 +};
 +static struct starq_geni starq_fg_se = {
-+	.vote = STARQ_VOTE_M_AHB | STARQ_VOTE_S_AHB | STARQ_VOTE_SE2,
-+	.halt = STARQ_GCC_SE2_HALT,
-+	.rcg = STARQ_GCC_SE2_RCG,
-+	.name = "fuel gauge i2c10",
++	.vote = STARQ_VOTE_M_AHB | STARQ_VOTE_S_AHB | STARQ_VOTE_SE6,
++	.halt = STARQ_GCC_SE6_HALT,
++	.rcg = STARQ_GCC_SE6_RCG,
++	.name = "fuel gauge i2c14",
 +};
 +
 +static vm_offset_t starq_gcc, starq_tlmm;
@@ -1197,10 +1233,20 @@
 +{
 +	starq_wr(starq_gcc, STARQ_GCC_VOTE, starq_rd(starq_gcc, STARQ_GCC_VOTE) | g->vote);
 +
-+	/* Source = XO (parent 0), divider 1: 19.2 MHz, as the mainline DT asks. */
++	/* Source = XO (parent 0), divider 1: 19.2 MHz, as the mainline DT asks.
++	 *
++	 * clk-rcg2.c defines CFG_SRC_DIV as shift 0 with CFG_SRC_DIV_LENGTH 8,
++	 * so the divider field is bits 0-7 and its mask is 0xff.  The old
++	 * 0x371f mask covered bits 0-4, 8-10 and 12-13 but not bits 5-7, so it
++	 * could leave a stale pre_div bit 7 set and the "divider is already 1"
++	 * test could not see it either.  0x37ff clears the whole divider field
++	 * and keeps SRC_SEL (8-10) and MODE (12-13) in the mask; bit 20
++	 * (CFG_HW_CLK_CTRL) is cleared separately because it would let hardware
++	 * fight the write.
++	 */
 +	uint32_t cfg = starq_rd(starq_gcc, g->rcg + 4u);
-+	if ((cfg & 0x371fu) != 1u) {
-+		starq_wr(starq_gcc, g->rcg + 4u, (cfg & ~(0x371fu | (1u << 20))) | 1u);
++	if ((cfg & 0x37ffu) != 1u) {
++		starq_wr(starq_gcc, g->rcg + 4u, (cfg & ~(0x37ffu | (1u << 20))) | 1u);
 +		starq_wr(starq_gcc, g->rcg, starq_rd(starq_gcc, g->rcg) | 1u);
 +		if (!starq_wait_clear(starq_gcc, g->rcg, 1u)) {
 +			printf("STARQ %s: RCG update timeout (rcg=%#x cfg=%#x)\n",
@@ -1371,36 +1417,63 @@
 +	return starq_geni_msg(g, addr, NULL, 0, buf, len, false);
 +}
 +
++/*
++ * Bring one SE up.
++ *
++ * Order matters.  The pads are muxed first (as inputs, output disabled, so
++ * nothing is driven), then the wrapper AHB and the SE branch are voted and
++ * un-gated, and only then is any SE register read.  GENI register space
++ * answers all-ones while its AHB branch is halted, which is exactly what
++ * made GENI_IF_DISABLE_RO (0x64) look set and blocked the touch with a
++ * message blaming bootloader-loaded firmware.
++ *
++ * The accept test is only what the driver actually needs: the SE must be
++ * programmed for I2C (proto 3) and have a usable FIFO (32-bit words, at
++ * least 2 entries deep).  SDM845 needs no bootloader-loaded firmware - the
++ * mainline i2c-qcom-geni.c only calls geni_load_se_firmware() when the
++ * proto reads GENI_SE_INVALID_PROTO (0xff), and this hardware reports 3.
++ * GENI_IF_DISABLE_RO is still read and printed, but it decides nothing: a
++ * set bit would mean FIFO mode is unavailable and GPI DMA is required,
++ * which is a different (unsupported here) configuration.
++ */
 +static bool
-+starq_geni_init(struct starq_geni *g, uint32_t se_pa, unsigned sda, unsigned scl)
++starq_geni_init(struct starq_geni *g, uint32_t se_pa, unsigned sda, unsigned scl,
++    unsigned mux)
 +{
 +	g->se = ml_io_map(se_pa, STARQ_SE_SIZE);
 +	if (!g->se) {
 +		printf("STARQ %s: SE mapping failed\n", g->name);
 +		return false;
 +	}
-+	uint32_t fw = starq_rd(g->se, SE_FW);
-+	uint32_t tx = starq_rd(g->se, SE_HW_TX), rx = starq_rd(g->se, SE_HW_RX);
-+	printf("STARQ %s: se=%#x fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
-+	    g->name, se_pa, fw, (fw >> 8) & 0xffu, starq_rd(g->se, SE_STATUS),
-+	    tx, rx, starq_rd(g->se, 0x908));
-+	if (((fw >> 8) & 0xffu) != 3u || (starq_rd(g->se, 0x64) & 1u) ||
-+	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
-+	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
-+		printf("STARQ %s: needs bootloader-loaded I2C firmware and 32-bit FIFOs\n",
-+		    g->name);
-+		return false;
-+	}
-+	if (starq_rd(g->se, SE_STATUS) & 0x1001u) {
-+		printf("STARQ %s: SE already busy; skipping\n", g->name);
-+		return false;
-+	}
++	starq_tlmm_cfg(sda, mux, TLMM_PULL_NONE, 0, false); /* 2 mA, no pull */
++	starq_tlmm_cfg(scl, mux, TLMM_PULL_NONE, 0, false);
 +	if (!starq_geni_clocks(g)) {
 +		return false;
 +	}
-+	starq_tlmm_cfg(sda, 1, TLMM_PULL_NONE, 0, false);   /* 2 mA, no pull */
-+	starq_tlmm_cfg(scl, 1, TLMM_PULL_NONE, 0, false);
-+
++	uint32_t fw = starq_rd(g->se, SE_FW);
++	uint32_t tx = starq_rd(g->se, SE_HW_TX), rx = starq_rd(g->se, SE_HW_RX);
++	uint32_t clk = starq_rd(g->se, SE_CLK_CTRL_RO);
++	uint32_t dis = starq_rd(g->se, SE_IF_DISABLE);
++	uint32_t ram = starq_rd(g->se, SE_HW_PROG_RAM);
++	uint32_t status = starq_rd(g->se, SE_STATUS);
++	uint32_t proto = (fw >> 8) & 0xffu;
++	uint32_t txw = (tx >> SE_FIFO_WIDTH_SHFT) & SE_FIFO_FIELD;
++	uint32_t rxw = (rx >> SE_FIFO_WIDTH_SHFT) & SE_FIFO_FIELD;
++	uint32_t txd = (tx >> SE_FIFO_DEPTH_SHFT) & SE_FIFO_FIELD;
++	uint32_t rxd = (rx >> SE_FIFO_DEPTH_SHFT) & SE_FIFO_FIELD;
++	printf("STARQ %s: se=%#x fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
++	    g->name, se_pa, fw, proto, status, tx, rx, starq_rd(g->se, 0x908));
++	printf("STARQ %s: clk_ctrl=%#x if_disable=%#x prog_ram=%#x txw=%u txd=%u rxw=%u rxd=%u\n",
++	    g->name, clk, dis, ram & SE_PROG_RAM_DEPTH, txw, txd, rxw, rxd);
++	if (proto != 3u || txw != 32u || rxw != 32u || txd < 2u || rxd < 2u) {
++		printf("STARQ %s: not usable as a FIFO I2C master "
++		    "(need proto 3 and 32-bit FIFOs >= 2 deep)\n", g->name);
++		return false;
++	}
++	if (status & 0x1001u) {
++		printf("STARQ %s: SE already busy; skipping\n", g->name);
++		return false;
++	}
 +	starq_wr(g->se, 0xe18, 0);          /* no GSI events */
 +	starq_wr(g->se, 0xe1c, 0);          /* no external IRQ routing: poll */
 +	starq_wr(g->se, 0x644, 0);
@@ -1412,7 +1485,7 @@
 +	starq_wr(g->se, 0x24, 0x7f);
 +	starq_wr(g->se, 0x20, 1);
 +	starq_wr(g->se, SE_CLK_SEL, 0);
-+	starq_wr(g->se, 0x48, starq_rd(g->se, 0x48) | 1u);   /* SER_M_CLK: 19.2 MHz */
++	starq_wr(g->se, SE_SER_M_CLK, SE_SER_M_CLK_100K); /* CLK_DIV=7, SER_CLK_EN */
 +	starq_wr(g->se, SE_SCL, SE_SCL_100K);
 +	starq_wr(g->se, 0x254, 0);
 +	starq_wr(g->se, 0x260, SE_PACK0);
@@ -1421,7 +1494,7 @@
 +	starq_wr(g->se, 0x288, SE_PACK1);
 +	starq_wr(g->se, SE_TX_WM, 0);
 +	starq_wr(g->se, 0x810, 0);
-+	starq_wr(g->se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
++	starq_wr(g->se, 0x814, rxd - 1u);              /* RX watermark = depth - 1 */
 +	starq_wr(g->se, SE_IRQ_EN, SE_EVENTS);
 +	if (starq_rd(g->se, 0x260) != SE_PACK0 || starq_rd(g->se, 0x264) != SE_PACK1 ||
 +	    starq_rd(g->se, 0x284) != SE_PACK0 || starq_rd(g->se, 0x288) != SE_PACK1 ||
@@ -1438,134 +1511,173 @@
 +}
 +
 +/* ------------------------------------------------------------------ */
-+/* S2DOS05 over a bit-banged I2C bus (i2c-21, TLMM gpio 127/128)      */
++/* Bit-banged I2C on TLMM pads                                        */
 +/* ------------------------------------------------------------------ */
 +
 +/*
-+ * The mainline DT drives this bus with i2c-gpio (sda-gpios/scl-gpios with
-+ * GPIO_OPEN_DRAIN, i2c-gpio,delay-us = <2>, external pull-ups, single
++ * Shared by the S2DOS05 bus (i2c-21, gpio 127/128) and, behind the
++ * starqtouchbb boot argument, by the touch controller on the qup11 pins
++ * (gpio 31/32) as a GENI-free fallback.
++ *
++ * The mainline DT drives the S2DOS05 bus with i2c-gpio (sda-gpios/scl-gpios
++ * with GPIO_OPEN_DRAIN, i2c-gpio,delay-us = <2>, external pull-ups, single
 + * master).  The pads have no open-drain mode here, so the driver emulates
 + * one: a "high" level releases SDA as an input (the external pull-up makes
 + * it high) and only a "low" level drives it.  SCL is master-driven
 + * push-pull, which is safe because the bus has a single master and the
-+ * slave never stretches the clock.
++ * slave never stretches the clock.  The touch bus is wired the same way.
 + */
-+#define S2_HALF_US 2
++#define BB_HALF_US 2
 +
 +static void
-+s2_sda_release(void)
++bb_sda_release(unsigned sda)
 +{
-+	starq_wr(starq_tlmm, TLMM_CTL(STARQ_I2C21_SDA),
-+	    (starq_rd(starq_tlmm, TLMM_CTL(STARQ_I2C21_SDA)) & ~TLMM_OE));
-+	delay(S2_HALF_US);
++	starq_wr(starq_tlmm, TLMM_CTL(sda),
++	    starq_rd(starq_tlmm, TLMM_CTL(sda)) & ~TLMM_OE);
++	delay(BB_HALF_US);
 +}
 +
 +static void
-+s2_sda_low(void)
++bb_sda_low(unsigned sda)
 +{
 +	/* Latch low first, then enable the output, so no high pulse is driven. */
-+	uint32_t io = starq_rd(starq_tlmm, TLMM_IO(STARQ_I2C21_SDA));
-+	starq_wr(starq_tlmm, TLMM_IO(STARQ_I2C21_SDA), io & ~TLMM_OUT_HIGH);
-+	starq_wr(starq_tlmm, TLMM_CTL(STARQ_I2C21_SDA),
-+	    starq_rd(starq_tlmm, TLMM_CTL(STARQ_I2C21_SDA)) | TLMM_OE);
-+	delay(S2_HALF_US);
++	uint32_t io = starq_rd(starq_tlmm, TLMM_IO(sda));
++	starq_wr(starq_tlmm, TLMM_IO(sda), io & ~TLMM_OUT_HIGH);
++	starq_wr(starq_tlmm, TLMM_CTL(sda),
++	    starq_rd(starq_tlmm, TLMM_CTL(sda)) | TLMM_OE);
++	delay(BB_HALF_US);
 +}
 +
 +static bool
-+s2_sda_level(void)
++bb_sda_level(unsigned sda)
 +{
-+	return (starq_rd(starq_tlmm, TLMM_IO(STARQ_I2C21_SDA)) & TLMM_IN) != 0;
++	return (starq_rd(starq_tlmm, TLMM_IO(sda)) & TLMM_IN) != 0;
 +}
 +
 +static void
-+s2_scl(bool high)
++bb_scl(unsigned scl, bool high)
 +{
-+	uint32_t io = starq_rd(starq_tlmm, TLMM_IO(STARQ_I2C21_SCL));
-+	starq_wr(starq_tlmm, TLMM_IO(STARQ_I2C21_SCL),
++	uint32_t io = starq_rd(starq_tlmm, TLMM_IO(scl));
++	starq_wr(starq_tlmm, TLMM_IO(scl),
 +	    high ? (io | TLMM_OUT_HIGH) : (io & ~TLMM_OUT_HIGH));
-+	delay(S2_HALF_US);
++	delay(BB_HALF_US);
 +}
 +
 +static void
-+s2_start(void)
++bb_bus_idle(unsigned sda, unsigned scl)
 +{
-+	s2_sda_release();
-+	s2_scl(true);
-+	s2_sda_low();
-+	s2_scl(false);
++	starq_tlmm_cfg(sda, STARQ_TLMM_MUX_GPIO, TLMM_PULL_NONE, 0, true);
++	starq_tlmm_cfg(scl, STARQ_TLMM_MUX_GPIO, TLMM_PULL_NONE, 0, true);
++	bb_scl(scl, true);
++	bb_sda_release(sda);
 +}
 +
 +static void
-+s2_stop(void)
++bb_start(unsigned sda, unsigned scl)
 +{
-+	s2_scl(false);
-+	s2_sda_low();
-+	s2_scl(true);
-+	s2_sda_release();
++	bb_sda_release(sda);
++	bb_scl(scl, true);
++	bb_sda_low(sda);
++	bb_scl(scl, false);
++}
++
++static void
++bb_stop(unsigned sda, unsigned scl)
++{
++	bb_scl(scl, false);
++	bb_sda_low(sda);
++	bb_scl(scl, true);
++	bb_sda_release(sda);
 +}
 +
 +/* Returns true when the slave acknowledged the byte. */
 +static bool
-+s2_byte(uint8_t b)
++bb_byte(unsigned sda, unsigned scl, uint8_t b)
 +{
 +	for (unsigned i = 0; i < 8; ++i) {
 +		if (b & 0x80u) {
-+			s2_sda_release();
++			bb_sda_release(sda);
 +		} else {
-+			s2_sda_low();
++			bb_sda_low(sda);
 +		}
-+		s2_scl(true);
-+		s2_scl(false);
++		bb_scl(scl, true);
++		bb_scl(scl, false);
 +		b <<= 1;
 +	}
-+	s2_sda_release();           /* let the slave drive the ACK bit */
-+	s2_scl(true);
-+	bool ack = !s2_sda_level();
-+	s2_scl(false);
++	bb_sda_release(sda);       /* let the slave drive the ACK bit */
++	bb_scl(scl, true);
++	bool ack = !bb_sda_level(sda);
++	bb_scl(scl, false);
 +	return ack;
 +}
 +
-+/* One byte, master NAK: this driver only ever reads single registers. */
++/* One byte: the master ACKs every byte except the last one it wants. */
 +static uint8_t
-+s2_read_byte(void)
++bb_read_byte(unsigned sda, unsigned scl, bool last)
 +{
 +	uint8_t b = 0;
-+	s2_sda_release();
++	bb_sda_release(sda);
 +	for (unsigned i = 0; i < 8; ++i) {
-+		s2_scl(true);
-+		b = (uint8_t)((b << 1) | (s2_sda_level() ? 1u : 0u));
-+		s2_scl(false);
++		bb_scl(scl, true);
++		b = (uint8_t)((b << 1) | (bb_sda_level(sda) ? 1u : 0u));
++		bb_scl(scl, false);
 +	}
-+	s2_sda_release();
-+	s2_scl(true);
-+	s2_scl(false);
++	if (last) {
++		bb_sda_release(sda);    /* NAK: no further byte wanted */
++	} else {
++		bb_sda_low(sda);        /* ACK: keep them coming */
++	}
++	bb_scl(scl, true);
++	bb_scl(scl, false);
++	bb_sda_release(sda);
 +	return b;
 +}
 +
++/* Write n data bytes after an 8-bit register pointer (n may be 0). */
++static bool
++bb_write(unsigned sda, unsigned scl, uint8_t addr7, uint8_t reg,
++    const uint8_t *data, unsigned n)
++{
++	bb_start(sda, scl);
++	bool ok = bb_byte(sda, scl, (uint8_t)(addr7 << 1));
++	ok = ok && bb_byte(sda, scl, reg);
++	for (unsigned i = 0; ok && i < n; ++i) {
++		ok = bb_byte(sda, scl, data[i]);
++	}
++	bb_stop(sda, scl);
++	return ok;
++}
++
++/* Register read: pointer write, repeated start, then n bytes with ACK/NAK. */
++static bool
++bb_read(unsigned sda, unsigned scl, uint8_t addr7, uint8_t reg,
++    uint8_t *buf, unsigned n)
++{
++	bb_start(sda, scl);
++	bool ok = bb_byte(sda, scl, (uint8_t)(addr7 << 1));
++	ok = ok && bb_byte(sda, scl, reg);
++	bb_start(sda, scl);         /* repeated start */
++	ok = ok && bb_byte(sda, scl, (uint8_t)((addr7 << 1) | 1u));
++	for (unsigned i = 0; ok && i < n; ++i) {
++		buf[i] = bb_read_byte(sda, scl, i + 1u == n);
++	}
++	bb_stop(sda, scl);
++	return ok;
++}
++
++/* S2DOS05 sits at 0x60 on gpio 127 (SDA) / 128 (SCL). */
 +static bool
 +s2_write(uint8_t reg, uint8_t value)
 +{
-+	s2_start();
-+	bool ok = s2_byte((uint8_t)(S2DOS05_ADDR << 1));
-+	ok = ok && s2_byte(reg);
-+	ok = ok && s2_byte(value);
-+	s2_stop();
-+	return ok;
++	return bb_write(STARQ_I2C21_SDA, STARQ_I2C21_SCL, S2DOS05_ADDR, reg,
++	    &value, 1);
 +}
 +
 +static bool
 +s2_read(uint8_t reg, uint8_t *value)
 +{
-+	s2_start();
-+	bool ok = s2_byte((uint8_t)(S2DOS05_ADDR << 1));
-+	ok = ok && s2_byte(reg);
-+	s2_start();                 /* repeated start */
-+	ok = ok && s2_byte((uint8_t)((S2DOS05_ADDR << 1) | 1u));
-+	if (ok) {
-+		*value = s2_read_byte();
-+	}
-+	s2_stop();
-+	return ok;
++	return bb_read(STARQ_I2C21_SDA, STARQ_I2C21_SCL, S2DOS05_ADDR, reg,
++	    value, 1);
 +}
 +
 +/*
@@ -1580,10 +1692,7 @@
 +
 +	/* Both pads as plain GPIO outputs, 2 mA, no internal pull (the bus has
 +	 * external pull-ups, the DT sets bias-disable and drive-strength 2). */
-+	starq_tlmm_cfg(STARQ_I2C21_SDA, 0, TLMM_PULL_NONE, 0, true);
-+	starq_tlmm_cfg(STARQ_I2C21_SCL, 0, TLMM_PULL_NONE, 0, true);
-+	s2_scl(true);
-+	s2_sda_release();
++	bb_bus_idle(STARQ_I2C21_SDA, STARQ_I2C21_SCL);
 +
 +	if (!s2_read(S2DOS05_DEV_ID, &id)) {
 +		printf("STARQ TOUCH: S2DOS05 at 0x60 did not answer; rails left as boot left them\n");
@@ -1627,12 +1736,33 @@
 +
 +static struct starq_geni *touch_se = &starq_touch_se;
 +
++/*
++ * GENI-free fallback, enabled with starqtouchbb=1 (default off, so the GENI
++ * path is tried first).  The pads of qup11 are driven as plain GPIOs with
++ * the same bit-bang code the S2DOS05 bus already uses successfully on this
++ * board, which removes the GENI serial engine, the wrapper AHB votes, the
++ * RCG, the FIFO packing and the DCP from the picture entirely.
++ *
++ * The pinctrl function index matters here: in pinctrl-sdm845.c gpio31/32 are
++ * PINGROUP(31, NORTH, qup11, qup14, ...), so index 0 is gpio and index 1 is
++ * qup11.  The GENI path muxes 1; the fallback muxes 0.  Both pin control
++ * registers are in the NORTH tile, 0x3900000 + 0x1000 * pin, i.e.
++ * TLMM_CTL(31) = 0x391f000 and TLMM_CTL(32) = 0x3920000 for the ctl
++ * registers - computed from STARQ_TLMM_NORTH_PA and TLMM_CTL() below, not
++ * hardcoded.
++ */
++static bool ts_bb;
++
 +static int
 +ts_write(uint8_t reg, const uint8_t *data, unsigned len)
 +{
 +	uint8_t tx[4];
 +	if (len > 3) {
 +		return EINVAL;
++	}
++	if (ts_bb) {
++		return bb_write(STARQ_TOUCH_SDA, STARQ_TOUCH_SCL, TS_ADDR, reg, data,
++		    len) ? 0 : EIO;
 +	}
 +	tx[0] = reg;
 +	for (unsigned i = 0; i < len; ++i) {
@@ -1644,6 +1774,10 @@
 +static int
 +ts_read(uint8_t reg, uint8_t *buf, unsigned len)
 +{
++	if (ts_bb) {
++		return bb_read(STARQ_TOUCH_SDA, STARQ_TOUCH_SCL, TS_ADDR, reg, buf,
++		    len) ? 0 : EIO;
++	}
 +	return starq_geni_read(touch_se, TS_ADDR, reg, buf, len);
 +}
 +
@@ -1722,10 +1856,28 @@
 +}
 +
 +/*
++ * Largest READ_ALL_EVENT block the transport can move in one transfer.
++ *
++ * GENI: 10 events = 80 bytes, below the driver's 90-byte RX FIFO limit.
++ * Bit-bang: 8 events = 64 bytes - the 64-byte block read the S6SY761 is
++ * specified for at register 0x61 (8 x 8-byte events).  Both stay inside the
++ * IC's 32-entry event stack.
++ */
++#define TS_GENI_BLOCK_EVENTS 10u
++#define TS_BB_BLOCK_EVENTS   8u
++#define TS_BLOCK_EVENTS_MAX  TS_GENI_BLOCK_EVENTS
++
++static unsigned
++ts_block_events(void)
++{
++	return ts_bb ? TS_BB_BLOCK_EVENTS : TS_GENI_BLOCK_EVENTS;
++}
++
++/*
 + * Drain the event stack.  One event is read at a time (8 bytes); the
 + * READ_ALL command then fetches the remaining ones in chunks that fit the
-+ * 32-word RX FIFO.  Reading is what de-asserts the interrupt line: there is
-+ * no acknowledge register.
++ * transport.  Reading is what de-asserts the interrupt line: there is no
++ * acknowledge register.
 + */
 +static int
 +ts_events(void)
@@ -1747,9 +1899,9 @@
 +	}
 +	ts_process(ev, 1);
 +	while (left) {
-+		/* 80 bytes per transfer: below the driver's 90-byte FIFO limit. */
-+		unsigned n = left > 10 ? 10 : left;
-+		uint8_t buf[10 * TS_EVENT_SIZE];
++		unsigned maxev = ts_block_events();
++		unsigned n = left > maxev ? maxev : left;
++		uint8_t buf[TS_BLOCK_EVENTS_MAX * TS_EVENT_SIZE];
 +		err = ts_read(TS_READ_ALL, buf, n * TS_EVENT_SIZE);
 +		if (err) {
 +			return err;
@@ -1876,8 +2028,10 @@
 +ts_start(void)
 +{
 +	thread_t thread;
-+	int enabled = 1;
++	int enabled = 1, bb = 0;
 +	(void)PE_parse_boot_argn("starqtouch", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("starqtouchbb", &bb, sizeof(bb));
++	ts_bb = bb != 0;
 +	(void)PE_parse_boot_argn("sweetfb_native", &ts.native, sizeof(ts.native));
 +	/*
 +	 * starqtouchirq=0 ignores the interrupt line and always polls (the
@@ -1891,7 +2045,18 @@
 +		return;
 +	}
 +	starq_tlmm_cfg(STARQ_TOUCH_IRQ, 0, TLMM_PULL_NONE, 0, false);
-+	if (!starq_geni_init(touch_se, STARQ_I2C_TOUCH_SE, STARQ_TOUCH_SDA, STARQ_TOUCH_SCL)) {
++	/*
++	 * starqtouchbb=1 selects the bit-banged bus and never touches the SE,
++	 * the wrapper clocks or the RCG, so a failure in any of those cannot
++	 * block input.  The GENI path stays the default.
++	 */
++	if (ts_bb) {
++		printf("STARQ TOUCH: starqtouchbb=1, bit-banging i2c on gpio %u/%u "
++		    "(mux %u, no GENI)\n", STARQ_TOUCH_SDA, STARQ_TOUCH_SCL,
++		    STARQ_TLMM_MUX_GPIO);
++		bb_bus_idle(STARQ_TOUCH_SDA, STARQ_TOUCH_SCL);
++	} else if (!starq_geni_init(touch_se, STARQ_I2C_TOUCH_SE, STARQ_TOUCH_SDA,
++	    STARQ_TOUCH_SCL, STARQ_TLMM_MUX_QUP11)) {
 +		return;
 +	}
 +	if (!s2dos05_touch_power()) {
@@ -1921,7 +2086,7 @@
 +}
 +
 +/* ------------------------------------------------------------------ */
-+/* MAX77705 fuel gauge (0x36) and charger (0x69) on i2c10             */
++/* MAX77705 fuel gauge (0x36) and charger (0x69) on i2c14             */
 +/* ------------------------------------------------------------------ */
 +
 +static bool
@@ -1964,7 +2129,8 @@
 +	uint8_t status = 0, ok = 0, dtls = 0, temp = 0;
 +
 +	if (!fg_ready) {
-+		if (!starq_geni_init(&starq_fg_se, STARQ_I2C_FG_SE, STARQ_FG_SDA, STARQ_FG_SCL)) {
++		if (!starq_geni_init(&starq_fg_se, STARQ_I2C_FG_SE, STARQ_FG_SDA, STARQ_FG_SCL,
++		    STARQ_TLMM_MUX_QUP14)) {
 +			return -1;
 +		}
 +		fg_ready = true;

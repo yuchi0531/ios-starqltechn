@@ -2,7 +2,90 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
-### >>> UPDATE 2026-10-23b (latest): `topOfKernelData` must be 16 KiB aligned — the MEET EARLY 7 panic <<<
+### >>> UPDATE 2026-10-23c (latest): touch blocker was two real GENI I2C bugs, not firmware <<<
+
+**Hardware result:** the iOS lock screen renders on the S9; **input is the only
+blocker.** The log said:
+```
+STARQ fuel gauge i2c10: se=0xa88000 fw=0x381 proto=3 status=0 tx=0x20102864 rx=0x20104900
+STARQ fuel gauge i2c10: needs bootloader-loaded I2C firmware and 32-bit FIFOs
+```
+Every printed operand is **good**: `fw=0x381` → `(fw>>8)&0xff = 3` = `GENI_SE_I2C`;
+`status=0` → both sequencers idle; `tx/rx` → FIFO width 32, depth 16. Mainline
+`i2c-qcom-geni.c` calls `geni_load_se_firmware()` **only** when proto == 0xFF
+(`GENI_SE_INVALID_PROTO`), so SDM845 I2C is firmware-free and the message was
+misleading. It never printed `0x64`, which is why this was hard to see.
+
+**The real bugs, all now fixed in `xnu/patches/0082-starqltechn-board.patch`:**
+
+1. **`GENI_IF_DISABLE_RO` (0x64) was a reject clause read before the SE clocks.**
+   The guard had six clauses and clause 2, `(starq_rd(g->se, 0x64) & 1u)`, could
+   never pass where it sat: it was evaluated *before* `starq_geni_clocks()`, so
+   the SE AHB could still be halted and an unimplemented/gated offset reads
+   all-ones. That clause is **gone**; `0x64` is still read and printed (renamed
+   `SE_IF_DISABLE`) but decides nothing.
+2. **Clocks now come first.** `starq_geni_clocks()` runs before *any* SE register
+   read; the pads are muxed first of all (as inputs, output disabled, so nothing
+   is driven). Nothing depended on the old order.
+3. **`GENI_SER_M_CLK_CFG` (0x48) wrote only `SER_CLK_EN`.** The code did
+   `starq_wr(se, 0x48, starq_rd(se, 0x48) | 1u)`; the older working SM7150 code
+   (patch 0060) wrote `(7u << 4) | 1u` and mainline `qcom_geni_i2c_conf()` writes
+   `(clk_div << CLK_DIV_SHFT) | SER_CLK_EN`. Now `SE_SER_M_CLK_100K =
+   (7 << 4) | 1 = 0x71`, written as a field (CLK_DIV is `GENMASK(15,4)`), not ORed
+   into a stale value.
+4. **RCG divider mask widened `0x371f` → `0x37ff`** (`CFG_SRC_DIV_LENGTH = 8`, so
+   the field is bits 0-7; the old mask missed bit 7).
+5. **Fuel gauge moved to the right SE.** Mainline `sdm845-samsung-starqltechn.dts`
+   puts max77705 on `&i2c14` = **`0xa98000`** (wrapper 1 SE6, `qup14`, gpio 33/34),
+   not `0xa88000` (i2c10/SE2). `STARQ_I2C_FG_SE` is now `0xa98000`, vote bit 28,
+   halt `0x18734`, RCG `0x18738`, pins 33/34. Android's own dmesg corroborates:
+   `i2c_geni a98000.i2c: i2c error :-107` from max77705. The touch at `0xa8c000`
+   (SE3, `qup11`, gpio 31/32) was already right and is untouched.
+6. **New GENI-free bit-bang fallback for the touch**, gated behind boot-arg
+   **`starqtouchbb=1` (default OFF**, so GENI is tried first). It reuses the
+   S2DOS05 bit-bang code, now generalised to `bb_*(sda, scl, ...)` with the pins
+   passed in; pin control registers are computed from `STARQ_TLMM_NORTH_PA` and
+   `TLMM_CTL()`, never hardcoded. `ts_read`/`ts_write` dispatch on the flag, and
+   `READ_ALL_EVENT` (0x61) drains in 8-event = **64-byte** blocks on bit-bang vs
+   10-event = 80-byte blocks on GENI.
+
+**Old vs new guard (verbatim):**
+```c
+/* OLD: six clauses; clause 2 cannot pass before the clocks are on */
+if (((fw >> 8) & 0xffu) != 3u || (starq_rd(g->se, 0x64) & 1u) ||
+    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
+    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
+        printf("... needs bootloader-loaded I2C firmware and 32-bit FIFOs\n");
+/* NEW: only proto and FIFO width/depth decide; 0x64 is diagnostic only */
+if (proto != 3u || txw != 32u || rxw != 32u || txd < 2u || rxd < 2u) {
+        printf("... not usable as a FIFO I2C master "
+            "(need proto 3 and 32-bit FIFOs >= 2 deep)\n");
+```
+with two print lines now carrying every operand:
+```
+STARQ <name>: se=%#x fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x
+STARQ <name>: clk_ctrl=%#x if_disable=%#x prog_ram=%#x txw=%u txd=%u rxw=%u rxd=%u
+```
+(`clk_ctrl` = 0x60 `GENI_CLK_CTRL_RO`, `if_disable` = 0x64, `prog_ram` = 0xe2c
+`HW_PARAM_2` `PROG_RAM_DEPTH[10:0]`.)
+
+**Host verification (no phone):** the hunk-count checker reports **119 hunks, 0
+bad**; `tools/validate-repo.py` passes (83 patches, 17 Python tools, 10 shell
+scripts); all 83 patches including 0082 apply cleanly with `git apply` to a fresh
+xnu-8796.141.3 tree (with the three `patches/*.sh` staging scripts run first);
+`bsd/dev/starqltechn_hw.c` as produced by the tree compiles clean under
+`gcc -fsyntax-only -Wall -Wextra` with stub headers; the stand-alone guard test
+(`/tmp/opencode/guard_test.c`) accepts the real operands for `0x64` = 0, 1 and
+`0xffffffff` and still rejects proto != 3 and every wrong FIFO shape;
+`tools/mkadt.py --board starqltechn` still emits the same 12588-byte ADT;
+`bash -n` passes on every script.
+
+**Not done:** not flashed. Next hardware boot: look for
+`STARQ touch i2c11: ... proto=3 ... txw=32 ...` (accept) instead of the old
+firmware message. If GENI still fails on the phone, boot with
+`starqtouchbb=1` added to `/chosen/bootargs` to rule GENI out entirely.
+
+### >>> UPDATE 2026-10-23b: `topOfKernelData` must be 16 KiB aligned — the MEET EARLY 7 panic <<<
 
 **Hardware result (real panic, S9 `starqltechn`, 16 KiB pages):**
 ```
