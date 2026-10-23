@@ -2,7 +2,63 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
-### >>> UPDATE 2026-10-23c (latest): touch blocker was two real GENI I2C bugs, not firmware <<<
+### >>> UPDATE 2026-10-23d (latest): data abort far=0x21000 — TLMM/GCC maps guarded, first-wins <<<
+
+**Hardware result (real panic, S9 `starqltechn`):**
+```
+panic(cpu 0 caller 0xfffffe0007ad4eb4): Kernel data abort. at pc 0xfffffe00074ea468, lr 0xfffffe00074ea454
+  x20: 0x00000000a98000   x21: 0x22   x22: 0x82
+  esr: 0x96000005  far: 0x00000000021000
+```
+
+**Root cause (ordering, not hardware):** `far` is exactly the *offset*
+`TLMM_CTL(33) = 0x1000 * 33 = 0x21000`, `x20` is `STARQ_I2C_FG_SE = 0xa98000`
+and `pc - lr = 0x14` is inside the inlined `starq_rd`. So
+`*(uint32_t *)(starq_tlmm + 0x21000)` ran with `starq_tlmm == 0`. Only
+`starqltechn_hw_init()` mapped `starq_gcc`/`starq_tlmm`, but there are two
+entry points and IOKit matching runs first:
+
+```
+StartIOKitMatching()            (PE_lockdown_iokit, osfmk/kern/startup.c:773)
+  -> SweetBattery::start()      (iokit/Kernel/arm/SweetBattery.cpp)
+     -> SweetBattery::poll()
+        -> starqltechn_battery_read()      [starq_tlmm still 0]
+           -> starq_geni_init(&starq_fg_se, 0xa98000, 33, 34, QUP14)
+              -> starq_tlmm_cfg(33, ...)
+                 -> starq_rd(starq_tlmm == 0, TLMM_CTL(33) == 0x21000)   <- fault
+```
+`starqltechn_hw_init()` only runs later, from
+`bsd_init -> setconf -> IOFindBSDRoot -> sweet_ufs_rootdev -> sweet_ufs_init`
+(`bsd/dev/sweet_ufs.c`). The `return` on a failed map could not help either:
+the battery path had its own copy of the assumption and never looked at the
+result.
+
+**Fix (patch 0082, `bsd/dev/starqltechn_hw.c` only; sweet behaviour untouched):**
+1. `starq_board_map(who)` — idempotent, first-wins, prints
+   `STARQ: mapped gcc/tlmm from <who> (gcc=… tlmm=…)` or
+   `STARQ: gcc/tlmm map FAILED in <who> (gcc=… tlmm=…)`. Called at the top of
+   `starqltechn_hw_init()`, `starqltechn_battery_read()`, `starq_geni_init()`
+   and `ts_start()`; no lock, the flag is set before either `ml_io_map`.
+2. `starq_map_ok(base, what)` — one-shot warning, used by `starq_rd()`,
+   `starq_wr()`, `starq_tlmm_cfg()` (now returns `bool`), `starq_geni_clocks()`
+   (already `bool`, now fails on `starq_gcc == 0`), and the four `bb_*`
+   helpers plus `s2dos05_touch_power()`.
+3. Failure is fatal for the dependent path only: battery read `-1`, touch
+   disabled, never a wild dereference.
+
+**Host verification (no phone):** hunk checker **119 hunks, 0 bad** (0083: 4/0);
+all 83 patches + the three staging scripts apply with `git apply` to a fresh
+xnu-8796.141.3 and 0083 still applies on top; the resulting
+`bsd/dev/starqltechn_hw.c` compiles `gcc -fsyntax-only -Wall -Wextra -Wformat=2
+-std=gnu11` with **0 warnings**; `/tmp/opencode/board_map_test.c` reproduces the
+old SIGSEGV at 0x21000 and shows both entry orders end with
+`starq_tlmm != 0` and exactly one mapping; `tools/validate-repo.py` passes.
+
+**Not done:** not flashed, no CI run. Next boot log must contain
+`STARQ: mapped gcc/tlmm from battery_read ...` (proves the ordering theory) or
+`... from hw_init ...`; a `map FAILED` line means `ml_io_map` itself is broken.
+
+### >>> UPDATE 2026-10-23c: touch blocker was two real GENI I2C bugs, not firmware <<<
 
 **Hardware result:** the iOS lock screen renders on the S9; **input is the only
 blocker.** The log said:

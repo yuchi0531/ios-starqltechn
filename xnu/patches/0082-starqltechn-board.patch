@@ -922,7 +922,7 @@
 +#endif /* SWEET */
 --- /dev/null
 +++ b/bsd/dev/starqltechn_hw.c
-@@ -0,0 +1,1259 @@
+@@ -0,0 +1,1410 @@
 +/*
 + * Samsung Galaxy S9 (SM-G9600 / SC-02K, "starqltechn", Qualcomm SDM845)
 + * board hardware that the SM7150 SWEET drivers do not cover:
@@ -1171,10 +1171,54 @@
 +};
 +
 +static vm_offset_t starq_gcc, starq_tlmm;
++/*
++ * These two maps have two entry points and only one of them was doing the
++ * mapping:
++ *
++ *   starqltechn_hw_init()      <- bsd_init -> setconf -> IOFindBSDRoot
++ *                                 (sweet_ufs_init, bsd/dev/sweet_ufs.c)
++ *   starqltechn_battery_read() <- SweetBattery::start()/poll(), i.e. IOKit
++ *                                 matching, which PE_lockdown_iokit() runs
++ *                                 BEFORE bsd_init
++ *
++ * so the battery path can get there first, and on the boot that panicked it
++ * did: starq_tlmm was still 0 when the fuel gauge was brought up,
++ * starq_tlmm_cfg() passed that 0 to starq_rd(), and starq_rd() dereferenced
++ * the bare offset.  That last step is not a theory - it is what the registers
++ * say: far 0x21000 == TLMM_CTL(STARQ_FG_SDA = 33), x20 == STARQ_I2C_FG_SE
++ * (0xa98000) and pc - lr == 0x14, i.e. inside starq_rd(), where a non-zero
++ * base would have made far base + 0x21000 instead of 0x21000.
++ *
++ * Now whichever entry point runs first maps both; the other reuses them.
++ */
++static bool starq_board_map_tried;
++
++/*
++ * Defence in depth: never dereference a base that was not mapped.  A single
++ * warning identifies the first offender; repeating it from the touch thread
++ * every 8 ms would bury the log.
++ */
++static bool
++starq_map_ok(vm_offset_t base, const char *what)
++{
++	static bool warned;
++
++	if (base != 0) {
++		return true;
++	}
++	if (!warned) {
++		warned = true;
++		printf("STARQ: %s with no mapping; skipping (repeats suppressed)\n", what);
++	}
++	return false;
++}
 +
 +static uint32_t
 +starq_rd(vm_offset_t base, uint32_t off)
 +{
++	if (!starq_map_ok(base, "MMIO read")) {
++		return 0;
++	}
 +	uint32_t v = *(volatile uint32_t *)(base + off);
 +	__asm__ volatile("dmb oshld" ::: "memory");
 +	return v;
@@ -1183,9 +1227,55 @@
 +static void
 +starq_wr(vm_offset_t base, uint32_t off, uint32_t val)
 +{
++	if (!starq_map_ok(base, "MMIO write")) {
++		return;
++	}
 +	__asm__ volatile("dmb oshst" ::: "memory");
 +	*(volatile uint32_t *)(base + off) = val;
 +	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++/*
++ * Map GCC and the NORTH TLMM once, first caller wins: a second ml_io_map
++ * would leak a second virtual range for no gain.  On failure both stay 0 and
++ * every dependent path fails closed (battery read returns -1, the touch is
++ * not started) instead of faulting.  The kernel VAs are printed so the next
++ * boot log shows they are real and which entry point mapped them.
++ *
++ * No lock: the flag is set before either ml_io_map, so two racing callers can
++ * never map twice.  The loser sees the flag with the bases not assigned yet,
++ * prints one "FAILED in an earlier call" line and fails its own path (the
++ * battery returns -1 and retries in 30 s, the touch stays off) - the safe
++ * direction, and it cannot happen in practice because these two run on the
++ * bsd_init thread and on the SweetBattery work loop.
++ */
++static bool
++starq_board_map(const char *who)
++{
++	vm_offset_t gcc, tlmm;
++
++	if (starq_board_map_tried) {
++		if (starq_gcc != 0 && starq_tlmm != 0) {
++			return true;
++		}
++		printf("STARQ: gcc/tlmm map FAILED in an earlier call; %s cannot "
++		    "proceed, board drivers disabled\n", who);
++		return false;
++	}
++	starq_board_map_tried = true;
++	gcc = ml_io_map(STARQ_GCC_PA, STARQ_GCC_SIZE);
++	tlmm = ml_io_map(STARQ_TLMM_NORTH_PA, STARQ_TLMM_NORTH_SIZE);
++	if (gcc == 0 || tlmm == 0) {
++		printf("STARQ: gcc/tlmm map FAILED in %s (gcc=%#llx tlmm=%#llx); "
++		    "board drivers disabled\n", who, (unsigned long long)gcc,
++		    (unsigned long long)tlmm);
++		return false;
++	}
++	starq_gcc = gcc;
++	starq_tlmm = tlmm;
++	printf("STARQ: mapped gcc/tlmm from %s (gcc=%#llx tlmm=%#llx)\n", who,
++	    (unsigned long long)gcc, (unsigned long long)tlmm);
++	return true;
 +}
 +
 +static void
@@ -1213,10 +1303,16 @@
 + * TLMM pad: mux selects the function, bias and drive strength follow the DT
 + * of the board, output enable is bit 9 of the ctl register.  The output
 + * latch is set before the pin becomes an output so no glitch is driven.
++ *
++ * Returns false when the pad block was never mapped, which is what the
++ * battery path used to hit: this used to dereference a null starq_tlmm.
 + */
-+static void
++static bool
 +starq_tlmm_cfg(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out)
 +{
++	if (!starq_map_ok(starq_tlmm, "TLMM pad config")) {
++		return false;
++	}
 +	uint32_t cfg = starq_rd(starq_tlmm, TLMM_CTL(pin));
 +	if (out) {
 +		uint32_t io = starq_rd(starq_tlmm, TLMM_IO(pin));
@@ -1225,12 +1321,16 @@
 +	cfg &= ~0x3ffu;
 +	cfg |= TLMM_MUX(mux) | pull | TLMM_DRV(drive) | (out ? TLMM_OE : 0);
 +	starq_wr(starq_tlmm, TLMM_CTL(pin), cfg);
++	return true;
 +}
 +
 +/* Vote the wrapper AHB and this SE's branch on, keeping other users' bits. */
 +static bool
 +starq_geni_clocks(struct starq_geni *g)
 +{
++	if (!starq_map_ok(starq_gcc, "GCC clock vote")) {
++		return false;
++	}
 +	starq_wr(starq_gcc, STARQ_GCC_VOTE, starq_rd(starq_gcc, STARQ_GCC_VOTE) | g->vote);
 +
 +	/* Source = XO (parent 0), divider 1: 19.2 MHz, as the mainline DT asks.
@@ -1440,13 +1540,23 @@
 +starq_geni_init(struct starq_geni *g, uint32_t se_pa, unsigned sda, unsigned scl,
 +    unsigned mux)
 +{
++	/*
++	 * The pads and the GCC vote are needed before any SE register is
++	 * touched, and only starq_board_map() may produce them.  Whichever of
++	 * hw_init and battery_read arrives first maps them.
++	 */
++	if (!starq_board_map(g->name)) {
++		return false;
++	}
 +	g->se = ml_io_map(se_pa, STARQ_SE_SIZE);
 +	if (!g->se) {
 +		printf("STARQ %s: SE mapping failed\n", g->name);
 +		return false;
 +	}
-+	starq_tlmm_cfg(sda, mux, TLMM_PULL_NONE, 0, false); /* 2 mA, no pull */
-+	starq_tlmm_cfg(scl, mux, TLMM_PULL_NONE, 0, false);
++	if (!starq_tlmm_cfg(sda, mux, TLMM_PULL_NONE, 0, false) || /* 2 mA, no pull */
++	    !starq_tlmm_cfg(scl, mux, TLMM_PULL_NONE, 0, false)) {
++		return false;
++	}
 +	if (!starq_geni_clocks(g)) {
 +		return false;
 +	}
@@ -1529,9 +1639,18 @@
 + */
 +#define BB_HALF_US 2
 +
++/*
++ * The bit-bang helpers below touch starq_tlmm directly.  starq_rd/starq_wr
++ * would already refuse a null base, but these paths are driven from the touch
++ * thread and from the S2DOS05 probe, so they bail out before doing anything
++ * at all if the pad block was never mapped.
++ */
 +static void
 +bb_sda_release(unsigned sda)
 +{
++	if (!starq_map_ok(starq_tlmm, "bit-bang SDA release")) {
++		return;
++	}
 +	starq_wr(starq_tlmm, TLMM_CTL(sda),
 +	    starq_rd(starq_tlmm, TLMM_CTL(sda)) & ~TLMM_OE);
 +	delay(BB_HALF_US);
@@ -1540,6 +1659,9 @@
 +static void
 +bb_sda_low(unsigned sda)
 +{
++	if (!starq_map_ok(starq_tlmm, "bit-bang SDA low")) {
++		return;
++	}
 +	/* Latch low first, then enable the output, so no high pulse is driven. */
 +	uint32_t io = starq_rd(starq_tlmm, TLMM_IO(sda));
 +	starq_wr(starq_tlmm, TLMM_IO(sda), io & ~TLMM_OUT_HIGH);
@@ -1551,12 +1673,18 @@
 +static bool
 +bb_sda_level(unsigned sda)
 +{
++	if (!starq_map_ok(starq_tlmm, "bit-bang SDA level")) {
++		return false;
++	}
 +	return (starq_rd(starq_tlmm, TLMM_IO(sda)) & TLMM_IN) != 0;
 +}
 +
 +static void
 +bb_scl(unsigned scl, bool high)
 +{
++	if (!starq_map_ok(starq_tlmm, "bit-bang SCL")) {
++		return;
++	}
 +	uint32_t io = starq_rd(starq_tlmm, TLMM_IO(scl));
 +	starq_wr(starq_tlmm, TLMM_IO(scl),
 +	    high ? (io | TLMM_OUT_HIGH) : (io & ~TLMM_OUT_HIGH));
@@ -1690,6 +1818,9 @@
 +{
 +	uint8_t id = 0, en = 0;
 +
++	if (!starq_map_ok(starq_tlmm, "S2DOS05 rail setup")) {
++		return false;
++	}
 +	/* Both pads as plain GPIO outputs, 2 mA, no internal pull (the bus has
 +	 * external pull-ups, the DT sets bias-disable and drive-strength 2). */
 +	bb_bus_idle(STARQ_I2C21_SDA, STARQ_I2C21_SCL);
@@ -2044,7 +2175,16 @@
 +		printf("STARQ TOUCH: disabled (starqtouch=0)\n");
 +		return;
 +	}
-+	starq_tlmm_cfg(STARQ_TOUCH_IRQ, 0, TLMM_PULL_NONE, 0, false);
++	/*
++	 * starqltechn_hw_init() maps these before calling here, but the check is
++	 * what makes the pad write below safe if some other path ever calls
++	 * ts_start() first.
++	 */
++	if (!starq_board_map("ts_start") ||
++	    !starq_tlmm_cfg(STARQ_TOUCH_IRQ, 0, TLMM_PULL_NONE, 0, false)) {
++		printf("STARQ TOUCH: TLMM not available; touch disabled\n");
++		return;
++	}
 +	/*
 +	 * starqtouchbb=1 selects the bit-banged bus and never touches the SE,
 +	 * the wrapper clocks or the RCG, so a failure in any of those cannot
@@ -2111,6 +2251,13 @@
 + * Returns 0 for a plausible sample.  The fuel gauge needs no initialization
 + * to report these registers: the bootloader leaves it converting.
 + *
++ * This path runs on an IOKit timer and does NOT depend on
++ * starqltechn_hw_init() having run: it maps GCC/TLMM itself on the first
++ * call (starq_board_map is idempotent and first-wins), and returns -1
++ * instead of touching hardware if that mapping failed.  Reaching
++ * starq_tlmm_cfg() with starq_tlmm == 0 is what produced the data abort at
++ * far 0x21000 on the S9.
++ *
 + *   STATUS        0x00  bit 3: battery absent
 + *   SOCREP        0x06  16-bit LE in 1/256 %, so whole % = hi + (lo >= 128)
 + *   VCELL         0x09  16-bit LE, 78.125 uV/LSB (a 12-bit mantissa with a
@@ -2129,8 +2276,9 @@
 +	uint8_t status = 0, ok = 0, dtls = 0, temp = 0;
 +
 +	if (!fg_ready) {
-+		if (!starq_geni_init(&starq_fg_se, STARQ_I2C_FG_SE, STARQ_FG_SDA, STARQ_FG_SCL,
-+		    STARQ_TLMM_MUX_QUP14)) {
++		if (!starq_board_map("battery_read") ||
++		    !starq_geni_init(&starq_fg_se, STARQ_I2C_FG_SE, STARQ_FG_SDA,
++		    STARQ_FG_SCL, STARQ_TLMM_MUX_QUP14)) {
 +			return -1;
 +		}
 +		fg_ready = true;
@@ -2172,10 +2320,13 @@
 +void
 +starqltechn_hw_init(void)
 +{
-+	starq_gcc = ml_io_map(STARQ_GCC_PA, STARQ_GCC_SIZE);
-+	starq_tlmm = ml_io_map(STARQ_TLMM_NORTH_PA, STARQ_TLMM_NORTH_SIZE);
-+	if (!starq_gcc || !starq_tlmm) {
-+		printf("STARQ: GCC/TLMM mapping failed; board drivers disabled\n");
++	/*
++	 * Maps GCC/TLMM (idempotent, first-wins) before anything dereferences
++	 * them; the fuel-gauge path may already have done it from the
++	 * SweetBattery timer.  The physical addresses stay in the log next to
++	 * the kernel VAs that starq_board_map() prints.
++	 */
++	if (!starq_board_map("hw_init")) {
 +		return;
 +	}
 +	printf("STARQ: gcc=%#x tlmm=%#x\n", STARQ_GCC_PA, STARQ_TLMM_NORTH_PA);
